@@ -453,7 +453,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // how the session started. Once hello gives us the install identity,
         // make it authoritative for both transports.
         if let installID = info.id {
-            displaySerial = Self.stableDisplaySerial(for: installID)
+            displaySerial = DisplayIdentity.serial(for: installID)
         }
         Log.info("phone hello: \(info.pixelsWide)x\(info.pixelsHigh) @\(info.scale)x maxFPS=\(info.maximumFrameRate) codec=\(activeCodec.displayName) target=\(activeFrameRate)Hz")
 
@@ -472,10 +472,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let advertisedName = info.name?.trimmingCharacters(in: .whitespacesAndNewlines)
         let fallbackName = endpointName.hasPrefix("iPhone / iPad") ? info.kind : endpointName
         let displayName = "OpenDisplay — \(advertisedName?.isEmpty == false ? advertisedName! : fallbackName)"
-        // Keep one stable identity across rotations. Reconfiguration below
-        // applies a new mode to the existing virtual monitor, so macOS keeps
-        // its windows and arrangement attached to this physical device.
-        let serial = displaySerial
+        // Keep one stable identity across rotations/transports. If Tahoe has
+        // poisoned that exact vendor/product/serial tuple and leaves a newly
+        // created display offline, advance a persisted per-device generation
+        // rather than randomizing the identity on every launch.
+        var serial = displaySerial
         // Arrangement memory (#116): keyed on the device's install id so the
         // display returns to its spot across transports and orientations —
         // the serial-keyed memory macOS keeps starts from scratch whenever
@@ -483,38 +484,66 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // session serial, which is at least orientation-stable.
         let arrangementKey = info.id ?? String(format: "serial-%08x", displaySerial)
         let sizeInPoints = CGSize(width: pointsWide, height: pointsHigh)
-        // Creating a display whose serial is still registered fails — e.g. a
-        // just-quit instance's display lingers in WindowServer for a moment
-        // after the process dies. Retry through that window instead of
-        // parking the session on "Failed" until a manual reconnect.
+        // Creating a display whose serial is still registered can fail briefly
+        // after a previous instance exits. Separately, Tahoe can accept the
+        // CGVirtualDisplay settings yet keep one saved identity permanently
+        // offline. Retry transient creation with the same serial; if a created
+        // display never becomes usable, roll only this physical device's serial.
         var vd: VirtualDisplay?
-        for attempt in 0..<8 {
-            if attempt > 0 { try await Task.sleep(for: .seconds(2)) }
-            // A Disconnect during the retry window tore the session down. Bail
-            // before creating/assigning the display: the serial the old display
-            // held is likely free now, so a late attempt would *succeed* and
-            // resurrect the very zombie this retry exists to avoid. (Mirrors the
-            // `if stopped` checks in the permission-poll loops above.)
-            if stopped { return }
-            vd = await MainActor.run {
-                let restoreOrigin = DisplayArrangement.origin(for: sizeInPoints, device: arrangementKey)
-                return VirtualDisplay(name: displayName,
-                                      pointsWide: pointsWide, pointsHigh: pointsHigh,
-                                      sizeInMillimeters: mm, serialNum: serial,
-                                      refreshRate: activeFrameRate,
-                                      restoreOrigin: restoreOrigin,
-                                      onOriginChange: { origin, currentSize in
-                                          DisplayArrangement.save(origin: origin, size: currentSize,
-                                                                  device: arrangementKey)
-                                      })
+        identityLoop: for identityAttempt in 0..<4 {
+            var candidate: VirtualDisplay?
+            for creationAttempt in 0..<8 {
+                if creationAttempt > 0 { try await Task.sleep(for: .seconds(2)) }
+                // A Disconnect during the retry window tore the session down.
+                // Bail before a late attempt resurrects a zombie display.
+                if stopped { return }
+                let serialForAttempt = serial
+                candidate = await MainActor.run {
+                    let restoreOrigin = DisplayArrangement.origin(for: sizeInPoints, device: arrangementKey)
+                    return VirtualDisplay(name: displayName,
+                                          pointsWide: pointsWide, pointsHigh: pointsHigh,
+                                          sizeInMillimeters: mm, serialNum: serialForAttempt,
+                                          refreshRate: activeFrameRate,
+                                          restoreOrigin: restoreOrigin,
+                                          onOriginChange: { origin, currentSize in
+                                              DisplayArrangement.save(origin: origin, size: currentSize,
+                                                                      device: arrangementKey)
+                                          })
+                }
+                if candidate != nil { break }
+                Log.info("virtual display creation failed (attempt \(creationAttempt + 1)) — retrying")
+                await status("Preparing virtual display…")
             }
-            if vd != nil { break }
-            Log.info("virtual display creation failed (attempt \(attempt + 1)) — retrying")
-            await status("Preparing virtual display…")
+
+            guard let candidate else {
+                throw NSError(domain: "MacSender", code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "CGVirtualDisplay creation failed"])
+            }
+            if await waitForDisplayUsable(id: candidate.displayID) {
+                vd = candidate
+                displaySerial = serial
+                break identityLoop
+            }
+            if stopped { return }
+
+            guard let deviceID = info.id else {
+                // Old receivers have no transport-independent identity. Keep
+                // their historical behavior instead of inventing a new serial.
+                vd = candidate
+                break identityLoop
+            }
+
+            let failedSerial = serial
+            serial = DisplayIdentity.rollover(for: deviceID)
+            displaySerial = serial
+            Log.info(String(format:
+                "virtual display identity %08X stayed offline/inactive — rolling to %08X (attempt %d)",
+                failedSerial, serial, identityAttempt + 1))
+            await status("Repairing virtual display identity…")
         }
         guard let vd else {
-            throw NSError(domain: "MacSender", code: 2,
-                          userInfo: [NSLocalizedDescriptionKey: "CGVirtualDisplay creation failed"])
+            throw NSError(domain: "MacSender", code: 5,
+                          userInfo: [NSLocalizedDescriptionKey: "virtual display identity stayed offline"])
         }
         virtualDisplay = vd
         inputInjector = InputInjector(displayID: vd.displayID)
@@ -584,7 +613,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Returns false when there is no reusable display or macOS rejected the
     /// mode switch, letting the caller use the legacy rebuild fallback.
     private func resizeExistingDisplay(for info: PhoneInfo) async throws -> Bool {
-        guard let vd = virtualDisplay else { return false }
+        guard let vd = virtualDisplay, vd.isUsable else { return false }
 
         let pointsWide = (info.pixelsWide / 2) & ~1
         let pointsHigh = (info.pixelsHigh / 2) & ~1
@@ -607,6 +636,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             Task { @MainActor in TestPattern.show(on: id) }
         }
         return true
+    }
+
+    /// Tahoe can accept CGVirtualDisplay settings yet leave the saved identity
+    /// offline/inactive. Give WindowServer a short readiness window before
+    /// deciding that this persisted identity needs a generation rollover.
+    private func waitForDisplayUsable(id: CGDirectDisplayID) async -> Bool {
+        for _ in 0..<10 {
+            if CGDisplayIsOnline(id) != 0, CGDisplayIsActive(id) != 0,
+               !CGDisplayBounds(id).isEmpty {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        return false
     }
 
     /// The virtual display takes a moment to show up in shareable content.
@@ -797,13 +840,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.asyncAfter(deadline: .now() + 3.0) { [weak self] in
             guard let self, !self.stopped, self.stream == nil,
                   let hello = self.lastHello else { return }
-            // Does our virtual display still exist? CGDisplayBounds returns a
-            // zero rect for an unknown id, so a non-empty bounds means it's live.
-            // Test isEmpty, not isNull: isNull is only true for the special
-            // CGRect.null, so it reads as "live" for a dead display too and the
-            // rebuild fallback below would become unreachable.
-            if let vd = self.virtualDisplay,
-               !CGDisplayBounds(vd.displayID).isEmpty {
+            // WindowServer may retain non-empty bounds for a display it has
+            // already marked offline. Re-attach only to an online, active
+            // display; otherwise rebuild and allow identity rollover.
+            if let vd = self.virtualDisplay, vd.isUsable {
                 Log.info("capture died — display still present, re-attaching capture only (#29)")
                 Task {
                     do {
@@ -825,8 +865,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 return
             }
-            // Display genuinely gone — full rebuild (preserves old behavior).
-            Log.info("capture died — rebuilding pipeline")
+            Log.info("capture died — display offline/inactive, rebuilding pipeline")
             Task {
                 await self.reconfigure(hello)
                 self.queue.async {
@@ -1324,12 +1363,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 break
             }
         }
-    }
-
-    private static func stableDisplaySerial(for identity: String) -> UInt32 {
-        var hash: UInt32 = 2_166_136_261
-        for byte in identity.utf8 { hash = (hash ^ UInt32(byte)) &* 16_777_619 }
-        return hash == 0 ? 1 : hash
     }
 
     private func waitForHello() async throws -> PhoneInfo {
