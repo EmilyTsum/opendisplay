@@ -11,11 +11,16 @@ import Foundation
 /// protocol 1 — that's every install in the field that predates the handshake.
 enum WireProtocol {
     /// The protocol version this build speaks.
-    static let version = 3
+    static let version = 4
 
     /// Protocol version that introduced Apple Pencil / proximity wire messages.
     /// Peers below this get pencil input as legacy `touch` events.
     static let pencilWireVersion = 3
+
+    /// Protocol version that introduced media capability negotiation: the
+    /// receiver advertises HEVC support, its maximum panel refresh rate, and
+    /// its user-configured display name in `hello`.
+    static let mediaCapabilitiesVersion = 4
 
     /// Oldest peer protocol version this build still supports. Stays at 1
     /// (support everything) until a deliberate two-phase breaking change
@@ -29,6 +34,13 @@ enum WireProtocol {
 /// Control-message `type` strings introduced with the handshake. The pre-
 /// existing types (`hello`, `ping`, `pong`, `touch`, …) stay inline for now to
 /// keep this change additive and low-risk; unify later if we do a wider pass.
+enum StreamCodec: String, Codable, CaseIterable {
+    case h264
+    case hevc
+
+    var displayName: String { self == .hevc ? "HEVC" : "H.264" }
+}
+
 enum WireMessage {
     static let welcome = "welcome"                  // Mac -> phone: Mac's pv + min supported
     static let updateRequired = "updateRequired"    // Mac -> phone: peer is below the Mac's floor

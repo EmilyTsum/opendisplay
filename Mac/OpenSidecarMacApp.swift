@@ -128,6 +128,7 @@ final class DeviceSession: ObservableObject, Identifiable {
     // "iPhone" / "iPad" from hello — naming fallback while (or in case)
     // lockdown hasn't resolved the device's real name.
     var deviceKind: String?
+    var advertisedName: String?
     // `target` names the identity the session was created for; the live
     // transport can migrate (cable-in upgrade, unplug failover) — these
     // track where the sender actually is right now.
@@ -184,6 +185,12 @@ final class SenderController: ObservableObject {
     @Published var mode = CaptureMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .extend
     @Published var quality = StreamQuality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .best {
         didSet { UserDefaults.standard.set(quality.rawValue, forKey: "quality") }
+    }
+    @Published var codecPreference = CodecPreference(rawValue: UserDefaults.standard.string(forKey: "codecPreference") ?? "") ?? .auto {
+        didSet { UserDefaults.standard.set(codecPreference.rawValue, forKey: "codecPreference") }
+    }
+    @Published var refreshRatePreference = RefreshRatePreference(rawValue: UserDefaults.standard.string(forKey: "refreshRatePreference") ?? "") ?? .auto {
+        didSet { UserDefaults.standard.set(refreshRatePreference.rawValue, forKey: "refreshRatePreference") }
     }
 
     var running: Bool { !sessions.isEmpty }
@@ -512,7 +519,10 @@ final class SenderController: ObservableObject {
 
         let name = label(for: target)
         let sender = MacSender(transport: transport, name: name, mode: mode,
-                               quality: quality, displaySerial: Self.displaySerial(for: id),
+                               quality: quality,
+                               codecPreference: codecPreference,
+                               refreshRatePreference: refreshRatePreference,
+                               displaySerial: Self.displaySerial(for: id),
                                awaitingWake: awaitingWake)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
         if case .wifi(let result) = target {
@@ -526,6 +536,7 @@ final class SenderController: ObservableObject {
             guard let self, let session else { return }
             session.deviceID = info.id
             session.deviceKind = info.device
+            session.advertisedName = info.name
             if case .usb(let udid?) = session.target, let installID = info.id {
                 self.installIDByUDID[udid] = installID
             }
@@ -574,6 +585,11 @@ final class SenderController: ObservableObject {
                 // stopped by the user while waiting — nothing to report
             } catch {
                 Log.info("sender failed to start: \(error)")
+                // A failed start used to leave partially-created virtual
+                // displays/capture resources alive behind a red status row.
+                // Tear everything down so privacy indicators and stale display
+                // identities cannot accumulate across retries.
+                sender.stop()
                 session.status = "Failed: \(error.localizedDescription)"
             }
         }
@@ -651,8 +667,9 @@ final class SenderController: ObservableObject {
             }
             entries.append(DeviceEntry(
                 id: "device:\(device.udid)",
-                name: device.name
+                name: activeSession(coveringUSB: device)?.advertisedName
                     ?? twin.flatMap(serviceName)
+                    ?? device.name
                     ?? session(for: usbTarget.sessionID)?.deviceKind
                     ?? "iPhone / iPad",
                 usbTarget: usbTarget,
@@ -832,6 +849,20 @@ struct ContentView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+
+                Picker("Codec", selection: $controller.codecPreference) {
+                    ForEach(CodecPreference.allCases, id: \.self) { pref in
+                        Text(pref.label).tag(pref)
+                    }
+                }
+                .onChange(of: controller.codecPreference) { controller.restartAll() }
+
+                Picker("Refresh rate", selection: $controller.refreshRatePreference) {
+                    ForEach(RefreshRatePreference.allCases, id: \.self) { pref in
+                        Text(pref.label).tag(pref)
+                    }
+                }
+                .onChange(of: controller.refreshRatePreference) { controller.restartAll() }
 
                 VStack(alignment: .leading, spacing: 4) {
                     Picker("Show app in", selection: $controller.presentation) {

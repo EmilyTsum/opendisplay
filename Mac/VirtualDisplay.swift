@@ -9,6 +9,7 @@ final class VirtualDisplay {
     private let display: CGVirtualDisplay
     private var settings: CGVirtualDisplaySettings
     private let maxPointsPerAxis: Int
+    private let refreshRate: Int
     private(set) var pointsWide: Int
     private(set) var pointsHigh: Int
 
@@ -27,7 +28,7 @@ final class VirtualDisplay {
     /// `onOriginChange` reports where the display sits afterwards, so the
     /// caller can persist user drags.
     init?(name: String, pointsWide: Int, pointsHigh: Int, sizeInMillimeters: CGSize,
-          serialNum: UInt32 = 0x0001, restoreOrigin: CGPoint? = nil,
+          serialNum: UInt32 = 0x0001, refreshRate: Int = 60, restoreOrigin: CGPoint? = nil,
           onOriginChange: ((CGPoint, CGSize) -> Void)? = nil) {
         self.pointsWide = pointsWide
         self.pointsHigh = pointsHigh
@@ -35,6 +36,7 @@ final class VirtualDisplay {
         // tablet change orientation by applying a new mode to this *same*
         // virtual monitor instead of removing it and stranding its windows.
         maxPointsPerAxis = max(pointsWide, pointsHigh)
+        self.refreshRate = max(30, min(refreshRate, 120))
         self.restoreTarget = restoreOrigin
         self.restoreUntil = restoreOrigin == nil ? .distantPast : Date().addingTimeInterval(6)
         self.onOriginChange = onOriginChange
@@ -57,13 +59,14 @@ final class VirtualDisplay {
         settings = CGVirtualDisplaySettings()
         settings.hiDPI = 1
         settings.modes = [
-            CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh), refreshRate: 60)
+            CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh),
+                                 refreshRate: Double(self.refreshRate))
         ]
         guard display.apply(settings) else {
             Log.info("CGVirtualDisplay applySettings FAILED")
             return nil
         }
-        Log.info("virtual display created: id=\(display.displayID) \(pointsWide)x\(pointsHigh)pt @2x")
+        Log.info("virtual display created: id=\(display.displayID) \(pointsWide)x\(pointsHigh)pt @2x \(self.refreshRate)Hz")
 
         // macOS defaults the new display to its 1x mode AND can restore a
         // stale saved mode for this serial asynchronously, seconds after the
@@ -105,7 +108,8 @@ final class VirtualDisplay {
         let newSettings = CGVirtualDisplaySettings()
         newSettings.hiDPI = 1
         newSettings.modes = [
-            CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh), refreshRate: 60)
+            CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh),
+                                 refreshRate: Double(self.refreshRate))
         ]
         guard display.apply(newSettings) else {
             Log.info("virtual display \(display.displayID) applySettings FAILED during resize")
@@ -151,6 +155,7 @@ final class VirtualDisplay {
         guard let modes = CGDisplayCopyAllDisplayModes(display.displayID, opts) as? [CGDisplayMode],
               let hidpi = modes.first(where: {
                   $0.width == pointsWide && $0.pixelWidth == pointsWide * 2
+                      && abs($0.refreshRate - Double(refreshRate)) < 1
               }) else {
             if recover {
                 Log.info("@2x mode vanished from display \(display.displayID) — re-applying settings")

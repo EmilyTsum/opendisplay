@@ -1,0 +1,70 @@
+name: Custom Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/hevc-120hz-device-identity
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: DEVELOPMENT_TEAM= xcodegen generate
+
+      - name: Build macOS app
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project OpenSidecar.xcodeproj \
+            -scheme OpenSidecarMac \
+            -configuration Release \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            MARKETING_VERSION=1.16.1-custom \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            build
+          APP="build/DerivedData/Build/Products/Release/OpenDisplay.app"
+          codesign --force --deep --sign - \
+            --entitlements Mac/OpenSidecarMac.entitlements "$APP"
+          mkdir -p build/artifacts
+          hdiutil create -volname "OpenDisplay Custom" -srcfolder "$APP" \
+            -ov -format UDZO build/artifacts/OpenDisplay-custom.dmg
+
+      - name: Build iOS app for local container/sideload use
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project OpenSidecar.xcodeproj \
+            -scheme OpenSidecariOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/iOSDerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            PRODUCT_BUNDLE_IDENTIFIER=com.emilytsum.opendisplay.custom \
+            MARKETING_VERSION=1.16.1-custom \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            build
+          APP="$(find build/iOSDerivedData/Build/Products/Release-iphoneos -maxdepth 1 -type d -name '*.app' | head -1)"
+          test -n "$APP" && test -d "$APP"
+          mkdir -p build/ipa/Payload build/artifacts
+          cp -R "$APP" build/ipa/Payload/
+          (cd build/ipa && ditto -c -k --sequesterRsrc --keepParent Payload ../artifacts/OpenDisplay-custom.ipa)
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenDisplay-custom-${{ github.run_number }}
+          path: |
+            build/artifacts/OpenDisplay-custom.dmg
+            build/artifacts/OpenDisplay-custom.ipa
+          if-no-files-found: error
