@@ -44,6 +44,9 @@ struct PerfStats: Equatable {
     var encInFlight = 0          // current VT in-flight count at last Mac ping
     var encPeak = 0              // peak VT in-flight count in the last Mac window
     var encLimit = 0             // active sender backpressure limit (1 at 60, 2 at 120)
+    var wireSendP50 = 0.0        // ProRes Network.framework completion latency
+    var wireSendP95 = 0.0
+    var wireFrameKB = 0.0        // average compressed ProRes frame size
     // Metal renderer path only:
     var decodeP50 = 0.0          // VTDecompressionSession decode, ms
     var photonP50 = 0.0          // Mac capture → frame actually on glass, ms
@@ -70,7 +73,6 @@ final class PhoneReceiver: ObservableObject {
     private var listenerHealthy = false
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "receiver.video")
-    private var buffer = Data()
     private var formatDesc: CMVideoFormatDescription?
     private var vps: Data?
     private var sps: Data?
@@ -116,6 +118,9 @@ final class PhoneReceiver: ObservableObject {
     private var macEncInFlight = 0
     private var macEncPeak = 0
     private var macEncLimit = 0
+    private var macWireSendP50 = 0.0
+    private var macWireSendP95 = 0.0
+    private var macWireFrameKB = 0.0
 
     private var nowMs: Double { Date().timeIntervalSince1970 * 1000 }
 
@@ -186,6 +191,9 @@ final class PhoneReceiver: ObservableObject {
 
     private var supportedCodecNames: [String] {
         var codecs: [String] = []
+        if VTIsHardwareDecodeSupported(kCMVideoCodecType_AppleProRes422Proxy) {
+            codecs.append(StreamCodec.proResProxy.rawValue)
+        }
         if VTIsHardwareDecodeSupported(kCMVideoCodecType_AppleProRes422LT) {
             codecs.append(StreamCodec.proResLT.rawValue)
         }
@@ -457,6 +465,9 @@ final class PhoneReceiver: ObservableObject {
             macEncInFlight = obj["encInFlight"] as? Int ?? macEncInFlight
             macEncPeak = obj["encPeak"] as? Int ?? macEncPeak
             macEncLimit = obj["encLimit"] as? Int ?? macEncLimit
+            macWireSendP50 = obj["wireMs50"] as? Double ?? macWireSendP50
+            macWireSendP95 = obj["wireMs95"] as? Double ?? macWireSendP95
+            macWireFrameKB = obj["frameKB"] as? Double ?? macWireFrameKB
         case "cursor":
             let visible = (obj["v"] as? Int ?? 0) == 1
             let x = obj["x"] as? Double ?? 0
@@ -508,7 +519,6 @@ final class PhoneReceiver: ObservableObject {
     }
 
     private func resetStreamState() {
-        buffer.removeAll(keepingCapacity: true)
         formatDesc = nil
         vps = nil
         sps = nil
@@ -597,42 +607,69 @@ final class PhoneReceiver: ObservableObject {
 
     // MARK: - Socket read + length-prefixed deframing
 
+    /// The wire is already length-prefixed, so ask Network.framework for one
+    /// complete frame at a time instead of accumulating 256 KiB chunks in a
+    /// growing Data buffer. This matters for ProRes where a single compressed
+    /// frame is commonly ~0.5–1 MiB: the old append/slice/compact path copied
+    /// those bytes several times before CoreMedia ever saw them.
     private func receive(on conn: NWConnection) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 18) {
+        receiveFrameHeader(on: conn)
+    }
+
+    private func receiveFrameHeader(on conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: 4, maximumLength: 4) {
             [weak self] data, _, isComplete, error in
-            guard let self else { return }
-            if let data, !data.isEmpty {
-                self.lastDataReceived = Date()
-                self.bytesThisWindow += data.count
-                self.buffer.append(data)
-                self.drainFrames()
-            }
+            guard let self, self.connection === conn else { return }
             if let error {
-                Log.info("receive error: \(error)")
+                Log.info("receive header error: \(error)")
                 return
             }
-            if isComplete {
-                Log.info("peer closed connection")
-                self.setConnected(false)
+            guard let data, data.count == 4 else {
+                if isComplete {
+                    Log.info("peer closed connection")
+                    self.setConnected(false)
+                }
                 return
             }
-            self.receive(on: conn)
+
+            self.lastDataReceived = Date()
+            self.bytesThisWindow += 4
+            let length = data.withUnsafeBytes {
+                Int(UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self)))
+            }
+            // Normal H.264/HEVC frames are much smaller and current native
+            // ProRes frames are around 1 MiB. Keep a generous corruption guard
+            // without allowing a bogus header to request unbounded buffering.
+            guard length > 0, length <= 32 * 1024 * 1024 else {
+                Log.info("invalid wire frame length: \(length)")
+                conn.cancel()
+                return
+            }
+            self.receiveFramePayload(length: length, on: conn)
         }
     }
 
-    private func drainFrames() {
-        // Cursor-based drain so we only compact the buffer once per batch.
-        var cursor = buffer.startIndex
-        while buffer.distance(from: cursor, to: buffer.endIndex) >= 4 {
-            let len = buffer[cursor..<buffer.index(cursor, offsetBy: 4)]
-                .withUnsafeBytes { Int(UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self))) }
-            guard buffer.distance(from: cursor, to: buffer.endIndex) >= 4 + len else { break }
-            let start = buffer.index(cursor, offsetBy: 4)
-            let end = buffer.index(start, offsetBy: len)
-            handleAnnexB(Data(buffer[start..<end]))
-            cursor = end
+    private func receiveFramePayload(length: Int, on conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: length, maximumLength: length) {
+            [weak self] data, _, isComplete, error in
+            guard let self, self.connection === conn else { return }
+            if let error {
+                Log.info("receive payload error: \(error)")
+                return
+            }
+            guard let data, data.count == length else {
+                if isComplete {
+                    Log.info("peer closed mid-frame")
+                    self.setConnected(false)
+                }
+                return
+            }
+
+            self.lastDataReceived = Date()
+            self.bytesThisWindow += data.count
+            self.handleAnnexB(data)
+            self.receiveFrameHeader(on: conn)
         }
-        buffer.removeSubrange(buffer.startIndex..<cursor)
     }
 
     // MARK: - Annex B -> CMSampleBuffer
@@ -655,8 +692,9 @@ final class PhoneReceiver: ObservableObject {
             }
             guard metaLength >= 0, data.count >= 8 + metaLength else { return }
             let metaData = Data(data[8..<(8 + metaLength)])
-            let sampleData = Data(data[(8 + metaLength)...])
-            handleProResFrame(metaData: metaData, sampleData: sampleData)
+            handleProResFrame(metaData: metaData,
+                              wireData: data,
+                              sampleOffset: 8 + metaLength)
             return
         }
 
@@ -748,11 +786,12 @@ final class PhoneReceiver: ObservableObject {
     /// and has no Annex-B parameter-set stream, so the sender includes the
     /// encoded dimensions in the small metadata header and CoreMedia can build
     /// the matching video format description directly.
-    private func handleProResFrame(metaData: Data, sampleData: Data) {
-        guard !renderingPaused, !sampleData.isEmpty,
+    private func handleProResFrame(metaData: Data, wireData: Data, sampleOffset: Int) {
+        let sampleLength = wireData.count - sampleOffset
+        guard !renderingPaused, sampleOffset >= 0, sampleLength > 0,
               let meta = try? JSONSerialization.jsonObject(with: metaData) as? [String: Any],
               let codecRaw = meta["codec"] as? String,
-              codecRaw == StreamCodec.proResLT.rawValue,
+              let codec = StreamCodec(rawValue: codecRaw), codec.isProRes,
               let width = (meta["w"] as? NSNumber)?.int32Value,
               let height = (meta["h"] as? NSNumber)?.int32Value,
               width > 0, height > 0 else { return }
@@ -760,29 +799,32 @@ final class PhoneReceiver: ObservableObject {
         let captureMs = (meta["cap"] as? NSNumber)?.doubleValue
         let sendMs = (meta["snd"] as? NSNumber)?.doubleValue
 
-        var needsFormat = streamCodec != .proResLT || formatDesc == nil
+        var needsFormat = streamCodec != codec || formatDesc == nil
         if let formatDesc {
             let dims = CMVideoFormatDescriptionGetDimensions(formatDesc)
             needsFormat = needsFormat || dims.width != width || dims.height != height
         }
         if needsFormat {
-            streamCodec = .proResLT
+            streamCodec = codec
             vps = nil
             sps = nil
             pps = nil
             formatDesc = nil
             displayLayer.flush()
             var desc: CMVideoFormatDescription?
+            let codecType: CMVideoCodecType = codec == .proResProxy
+                ? kCMVideoCodecType_AppleProRes422Proxy
+                : kCMVideoCodecType_AppleProRes422LT
             let status = CMVideoFormatDescriptionCreate(
                 allocator: kCFAllocatorDefault,
-                codecType: kCMVideoCodecType_AppleProRes422LT,
+                codecType: codecType,
                 width: width,
                 height: height,
                 extensions: nil,
                 formatDescriptionOut: &desc)
             formatDesc = desc
             finishFormatDescription(status)
-            Log.info("stream codec changed -> \(StreamCodec.proResLT.displayName)")
+            Log.info("stream codec changed -> \(codec.displayName)")
         }
         guard let formatDesc else { return }
 
@@ -790,23 +832,27 @@ final class PhoneReceiver: ObservableObject {
         guard CMBlockBufferCreateWithMemoryBlock(
                 allocator: kCFAllocatorDefault,
                 memoryBlock: nil,
-                blockLength: sampleData.count,
+                blockLength: sampleLength,
                 blockAllocator: kCFAllocatorDefault,
                 customBlockSource: nil,
                 offsetToData: 0,
-                dataLength: sampleData.count,
+                dataLength: sampleLength,
                 flags: 0,
                 blockBufferOut: &blockBuffer) == noErr,
               let blockBuffer else { return }
-        let copyStatus = sampleData.withUnsafeBytes { raw in
+        // Copy directly from the Network.framework receive buffer into the
+        // CoreMedia-owned block. Avoid materializing another ~1 MiB Data just
+        // for the ProRes sample slice.
+        let copyStatus = wireData.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return kCMBlockBufferBadCustomBlockSourceErr }
             CMBlockBufferReplaceDataBytes(
-                with: raw.baseAddress!, blockBuffer: blockBuffer,
-                offsetIntoDestination: 0, dataLength: sampleData.count)
+                with: base.advanced(by: sampleOffset), blockBuffer: blockBuffer,
+                offsetIntoDestination: 0, dataLength: sampleLength)
         }
         guard copyStatus == noErr else { return }
 
         var sample: CMSampleBuffer?
-        var size = sampleData.count
+        var size = sampleLength
         let status = CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault,
             dataBuffer: blockBuffer,
@@ -1015,6 +1061,9 @@ final class PhoneReceiver: ObservableObject {
             stats.encInFlight = macEncInFlight
             stats.encPeak = macEncPeak
             stats.encLimit = macEncLimit
+            stats.wireSendP50 = macWireSendP50
+            stats.wireSendP95 = macWireSendP95
+            stats.wireFrameKB = macWireFrameKB
             stats.decodeP50 = percentile(decodeWindow, 0.5)
             stats.photonP50 = percentile(photonWindow, 0.5)
             stats.photonP95 = percentile(photonWindow, 0.95)

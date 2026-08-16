@@ -416,6 +416,13 @@ struct PerfOverlay: View {
                 if stats.encLimit > 0 {
                     metric("VT flight", "\(stats.encPeak)/\(stats.encLimit)")
                 }
+                if stats.wireSendP50 > 0 {
+                    metric("wire p50", String(format: "%.1f ms", stats.wireSendP50))
+                    metric("wire p95", String(format: "%.1f ms", stats.wireSendP95))
+                }
+                if stats.wireFrameKB > 0 {
+                    metric("KB/frame", String(format: "%.0f", stats.wireFrameKB))
+                }
                 metric("Mbit/s", String(format: "%.1f", stats.mbps))
                 metric("stalls", "\(stats.stalls)")
                 metric("enc↓", "\(stats.macEncDrops)")

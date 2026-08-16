@@ -38,12 +38,18 @@ enum StreamCodec: String, Codable, CaseIterable {
     case h264
     case hevc
     case proResLT = "proresLT"
+    case proResProxy = "proresProxy"
+
+    var isProRes: Bool {
+        self == .proResLT || self == .proResProxy
+    }
 
     var displayName: String {
         switch self {
         case .h264: return "H.264"
         case .hevc: return "HEVC"
         case .proResLT: return "ProRes 422 LT"
+        case .proResProxy: return "ProRes 422 Proxy"
         }
     }
 }

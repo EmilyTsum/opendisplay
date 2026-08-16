@@ -52,7 +52,7 @@ enum StreamQuality: String, CaseIterable {
         case (.best, .h264): base = 48_000_000
         case (.balanced, .h264): base = 28_000_000
         case (.fast, .h264): base = 14_000_000
-        case (_, .proResLT): base = 0 // fixed-quality intraframe codec; VT owns rate
+        case (_, .proResLT), (_, .proResProxy): base = 0 // fixed-quality intraframe; VT owns rate
         }
         return frameRate >= 100 ? Int(Double(base) * 1.5) : base
     }
@@ -76,7 +76,7 @@ enum StreamQuality: String, CaseIterable {
 
 
 enum CodecPreference: String, CaseIterable {
-    case auto, hevc, h264, proResLT
+    case auto, hevc, h264, proResLT, proResProxy
 
     var label: String {
         switch self {
@@ -84,15 +84,21 @@ enum CodecPreference: String, CaseIterable {
         case .hevc: return "HEVC"
         case .h264: return "H.264"
         case .proResLT: return "ProRes 422 LT (experimental)"
+        case .proResProxy: return "ProRes 422 Proxy (experimental)"
         }
     }
 
-    func resolved(peerSupportsHEVC: Bool, peerSupportsProResLT: Bool) -> StreamCodec {
+    func resolved(peerSupportsHEVC: Bool,
+                  peerSupportsProResLT: Bool,
+                  peerSupportsProResProxy: Bool) -> StreamCodec {
         switch self {
         case .h264: return .h264
         case .auto, .hevc: return peerSupportsHEVC ? .hevc : .h264
         case .proResLT:
             if peerSupportsProResLT { return .proResLT }
+            return peerSupportsHEVC ? .hevc : .h264
+        case .proResProxy:
+            if peerSupportsProResProxy { return .proResProxy }
             return peerSupportsHEVC ? .hevc : .h264
         }
     }
@@ -144,6 +150,10 @@ struct PhoneInfo: Decodable {
         protocolVersion >= WireProtocol.mediaCapabilitiesVersion
             && (codecs?.contains(StreamCodec.proResLT.rawValue) ?? false)
     }
+    var supportsProResProxy: Bool {
+        protocolVersion >= WireProtocol.mediaCapabilitiesVersion
+            && (codecs?.contains(StreamCodec.proResProxy.rawValue) ?? false)
+    }
 }
 
 /// How the sender reaches the receiver. Reconnects re-dial from scratch, so
@@ -151,6 +161,18 @@ struct PhoneInfo: Decodable {
 enum SenderTransport {
     case tcp(NWEndpoint)                   // WiFi (Bonjour) or -host/-port override
     case usb(udid: String?, port: UInt16)  // native usbmuxd dial; nil = first device
+}
+
+/// One ProRes frame split into a tiny protocol prefix and the compressed
+/// sample bytes. When `retainedSample` is non-nil, `sampleBytes` is a no-copy
+/// view onto the CMSampleBuffer storage and that sample must stay alive until
+/// Network.framework reports the send as processed.
+private struct ProResWirePacket {
+    let prefix: Data
+    let sampleBytes: Data
+    let retainedSample: CMSampleBuffer?
+
+    var wireByteCount: Int { prefix.count + sampleBytes.count }
 }
 
 @available(macOS 14.0, *)
@@ -240,12 +262,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // bottleneck fired. Never encode-then-discard: dropping here avoids wasting
     // VT work on frames that would only add latency.
     private var pendingSends = 0
-    private var maxPendingSends: Int { activeCodec == .proResLT ? 1 : 3 }
+    private var maxPendingSends: Int { activeCodec.isProRes ? 1 : 3 }
     // ProRes is all-intra: when the wire is busy, retain only the newest
     // completed compressed frame instead of queuing stale frames behind it.
     // This slot is intentionally one deep and is drained immediately when the
     // current Network.framework send completes.
-    private var pendingProResFrame: Data?
+    private var pendingProResFrame: ProResWirePacket?
+    private var proResSendDurationsThisWindow: [Double] = []
+    private var proResFrameBytesThisWindow: [Int] = []
     private let pipelineLock = NSLock()
     private var dropsEncThisWindow = 0
     private var dropsNetThisWindow = 0
@@ -446,7 +470,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         activeFrameRate = refreshRatePreference.resolved(deviceMaximum: info.maximumFrameRate)
         activeCodec = codecPreference.resolved(
             peerSupportsHEVC: info.supportsHEVC,
-            peerSupportsProResLT: info.supportsProResLT)
+            peerSupportsProResLT: info.supportsProResLT,
+            peerSupportsProResProxy: info.supportsProResProxy)
         // USB session IDs are based on the hardware UDID while WiFi IDs are
         // based on Bonjour names. Deriving the display serial from either made
         // the *same iPad* become two different virtual monitors depending on
@@ -1083,10 +1108,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 let enc50 = encSorted.isEmpty ? 0 : encSorted[encSorted.count / 2]
                 let enc95 = encSorted.isEmpty ? 0 : encSorted[min(encSorted.count - 1, Int(Double(encSorted.count) * 0.95))]
 
+                let wireSorted = self.proResSendDurationsThisWindow.sorted()
+                let wire50 = wireSorted.isEmpty ? 0 : wireSorted[wireSorted.count / 2]
+                let wire95 = wireSorted.isEmpty ? 0 : wireSorted[min(wireSorted.count - 1, Int(Double(wireSorted.count) * 0.95))]
+                let frameKB = self.proResFrameBytesThisWindow.isEmpty ? 0 :
+                    Double(self.proResFrameBytesThisWindow.reduce(0, +)) /
+                    Double(self.proResFrameBytesThisWindow.count) / 1024.0
+                self.proResSendDurationsThisWindow.removeAll(keepingCapacity: true)
+                self.proResFrameBytesThisWindow.removeAll(keepingCapacity: true)
+
                 let sorted = self.inputLatencies.sorted()
                 let inp50 = sorted.isEmpty ? 0 : sorted[sorted.count / 2].rounded()
                 let inp95 = sorted.isEmpty ? 0 : sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.95))].rounded()
-                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps),\"encFps\":\(encFps),\"encMs50\":\(enc50),\"encMs95\":\(enc95),\"encInFlight\":\(encodeInflightNow),\"encPeak\":\(encodeInflightPeak),\"encLimit\":\(self.maxPendingEncodes)}")
+                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps),\"encFps\":\(encFps),\"encMs50\":\(enc50),\"encMs95\":\(enc95),\"encInFlight\":\(encodeInflightNow),\"encPeak\":\(encodeInflightPeak),\"encLimit\":\(self.maxPendingEncodes),\"wireMs50\":\(wire50),\"wireMs95\":\(wire95),\"frameKB\":\(frameKB)}")
             }
             self.schedulePing()
         }
@@ -1387,7 +1421,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // Apple's low-latency rate-control encoder specification is for the
         // inter-frame codecs. ProRes is intra-only and should be created with
         // the normal encoder specification.
-        let spec: CFDictionary? = lowLatency && codec != .proResLT
+        let spec: CFDictionary? = lowLatency && !codec.isProRes
             ? [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue] as CFDictionary
             : nil
         let codecType: CMVideoCodecType
@@ -1395,6 +1429,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         case .h264: codecType = kCMVideoCodecType_H264
         case .hevc: codecType = kCMVideoCodecType_HEVC
         case .proResLT: codecType = kCMVideoCodecType_AppleProRes422LT
+        case .proResProxy: codecType = kCMVideoCodecType_AppleProRes422Proxy
         }
         return VTCompressionSessionCreate(
             allocator: nil,
@@ -1418,7 +1453,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             var status = createCompressionSession(width: width, height: height,
                                                   codec: codec, lowLatency: lowLatency)
             var usedFallback = false
-            if encoder == nil, lowLatency, codec != .proResLT {
+            if encoder == nil, lowLatency, !codec.isProRes {
                 Log.info("VTCompressionSessionCreate \(codec.displayName) failed with low-latency RC (status \(status)) — retrying normally")
                 status = createCompressionSession(width: width, height: height,
                                                   codec: codec, lowLatency: false)
@@ -1432,8 +1467,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // Capability negotiation says the receiver can decode the selected
             // codec, but the Mac encoder can still reject it. ProRes first falls
             // back to HEVC when possible; HEVC itself falls back to H.264.
-            if activeCodec == .proResLT, lastHello?.supportsHEVC == true {
-                Log.info("ProRes LT encoder unavailable (status \(status)) — falling back to HEVC")
+            if activeCodec.isProRes, lastHello?.supportsHEVC == true {
+                Log.info("\(activeCodec.displayName) encoder unavailable (status \(status)) — falling back to HEVC")
                 activeCodec = .hevc
                 (status, usedLowLatencyFallback) = create(.hevc)
             }
@@ -1453,7 +1488,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        if activeCodec != .proResLT {
+        if !activeCodec.isProRes {
             let profile: CFString = activeCodec == .hevc
                 ? kVTProfileLevel_HEVC_Main_AutoLevel
                 : kVTProfileLevel_H264_High_AutoLevel
@@ -1473,7 +1508,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                              value: kCFBooleanTrue)
         VTCompressionSessionPrepareToEncodeFrames(encoder)
         let rateLabel = bitrate > 0 ? "\(bitrate / 1_000_000)Mbps" : "fixed-quality"
-        Log.info("encoder ready: \(width)x\(height) \(activeCodec.displayName) \(rateLabel) \(frameRate)fps quality=\(quality.rawValue) lowLatencyRC=\(activeCodec != .proResLT && lowLatency && !usedLowLatencyFallback)\(usedLowLatencyFallback ? " (fallback)" : "")")
+        Log.info("encoder ready: \(width)x\(height) \(activeCodec.displayName) \(rateLabel) \(frameRate)fps quality=\(quality.rawValue) lowLatencyRC=\(!activeCodec.isProRes && lowLatency && !usedLowLatencyFallback)\(usedLowLatencyFallback ? " (fallback)" : "")")
     }
 
     // MARK: - Capture callback
@@ -1500,7 +1535,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // already know cannot be sent promptly. ProRes is different: every
         // frame is independently decodable, so its send path keeps a one-deep
         // latest-wins compressed slot and can safely supersede an older frame.
-        if activeCodec != .proResLT, shouldDropFrame(reason: "pending_sends") { return }
+        if !activeCodec.isProRes, shouldDropFrame(reason: "pending_sends") { return }
 
         encode(pixelBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), generation: generation)
     }
@@ -1583,7 +1618,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let capturedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
         var frameProperties: CFDictionary?
         if needsKeyframe {
-            if codecAtSubmit != .proResLT {
+            if !codecAtSubmit.isProRes {
                 frameProperties = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as CFDictionary
             }
             needsKeyframe = false
@@ -1623,11 +1658,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
             guard generation == self.captureGenerationNow else { return }
             let sndMs = Int64(Date().timeIntervalSince1970 * 1000)
-            if codecAtSubmit == .proResLT {
-                if let framed = self.proResWireFrame(from: buffer,
-                                                      captureMs: capturedAtMs,
-                                                      sendMs: sndMs) {
-                    self.enqueueLatestProResFrame(framed)
+            if codecAtSubmit.isProRes {
+                if let packet = self.proResWirePacket(from: buffer,
+                                                       codec: codecAtSubmit,
+                                                       captureMs: capturedAtMs,
+                                                       sendMs: sndMs) {
+                    self.enqueueLatestProResFrame(packet)
                 }
             } else if let data = self.annexB(from: buffer) {
                 var framed = Data("{\"cap\":\(capturedAtMs),\"snd\":\(sndMs),\"codec\":\"\(codecAtSubmit.rawValue)\"}".utf8)
@@ -1797,9 +1833,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// ["ODPR"][u32 metadata length][JSON metadata][ProRes sample bytes].
     /// The outer OpenDisplay u32 frame length remains unchanged, so old codecs
     /// and all control messages keep their existing wire format.
-    private func proResWireFrame(from sample: CMSampleBuffer,
-                                 captureMs: Int64,
-                                 sendMs: Int64) -> Data? {
+    private func proResWirePacket(from sample: CMSampleBuffer,
+                                  codec: StreamCodec,
+                                  captureMs: Int64,
+                                  sendMs: Int64) -> ProResWirePacket? {
         guard let block = CMSampleBufferGetDataBuffer(sample),
               let format = CMSampleBufferGetFormatDescription(sample) else { return nil }
         let total = CMBlockBufferGetDataLength(block)
@@ -1809,27 +1846,65 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let meta: [String: Any] = [
             "cap": captureMs,
             "snd": sendMs,
-            "codec": StreamCodec.proResLT.rawValue,
+            "codec": codec.rawValue,
             "w": Int(dims.width),
             "h": Int(dims.height),
         ]
         guard let metaData = try? JSONSerialization.data(withJSONObject: meta),
               metaData.count <= Int(UInt32.max) else { return nil }
 
-        var sampleData = Data(count: total)
-        let copyStatus = sampleData.withUnsafeMutableBytes { raw in
-            return CMBlockBufferCopyDataBytes(block, atOffset: 0,
-                                              dataLength: total,
-                                              destination: raw.baseAddress!)
-        }
-        guard copyStatus == noErr else { return nil }
+        // Prefer a no-copy view of VideoToolbox's contiguous compressed output.
+        // Keep the CMSampleBuffer alive in the packet until the network send
+        // completes. Fall back to one owned copy only for non-contiguous blocks.
+        var contiguousLength = 0
+        var totalLength = 0
+        var pointer: UnsafeMutablePointer<Int8>?
+        let pointerStatus = CMBlockBufferGetDataPointer(
+            block, atOffset: 0,
+            lengthAtOffsetOut: &contiguousLength,
+            totalLengthOut: &totalLength,
+            dataPointerOut: &pointer)
 
-        var out = Data("ODPR".utf8)
+        let sampleBytes: Data
+        let retainedSample: CMSampleBuffer?
+        if pointerStatus == noErr,
+           contiguousLength == total,
+           totalLength == total,
+           let pointer {
+            sampleBytes = Data(bytesNoCopy: UnsafeMutableRawPointer(pointer),
+                               count: total,
+                               deallocator: .none)
+            retainedSample = sample
+        } else {
+            var copied = Data(count: total)
+            let copyStatus = copied.withUnsafeMutableBytes { raw in
+                guard let base = raw.baseAddress else {
+                    return kCMBlockBufferBadCustomBlockSourceErr
+                }
+                return CMBlockBufferCopyDataBytes(block, atOffset: 0,
+                                                  dataLength: total,
+                                                  destination: base)
+            }
+            guard copyStatus == noErr else { return nil }
+            sampleBytes = copied
+            retainedSample = nil
+        }
+
+        // Prefix includes the *outer* OpenDisplay length as well as the ProRes
+        // sub-header. Sending prefix + sampleBytes separately preserves the TCP
+        // byte stream while avoiding concatenating the multi-hundred-KiB sample.
+        let innerPrefixLength = 4 + 4 + metaData.count // "ODPR" + meta length + JSON
+        let payloadLength = innerPrefixLength + total
+        guard payloadLength <= Int(UInt32.max) else { return nil }
+        var outerLength = UInt32(payloadLength).bigEndian
+        var prefix = Data(bytes: &outerLength, count: 4)
+        prefix.append(Data("ODPR".utf8))
         var metaLength = UInt32(metaData.count).bigEndian
-        out.append(Data(bytes: &metaLength, count: 4))
-        out.append(metaData)
-        out.append(sampleData)
-        return out
+        prefix.append(Data(bytes: &metaLength, count: 4))
+        prefix.append(metaData)
+        return ProResWirePacket(prefix: prefix,
+                                sampleBytes: sampleBytes,
+                                retainedSample: retainedSample)
     }
 
     // MARK: - Wire framing: [4-byte big-endian length][payload]
@@ -1874,13 +1949,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// exactly one send in flight and at most one waiting frame. Any newer
     /// completed frame replaces the waiting one because there is no temporal
     /// dependency between ProRes frames.
-    private func enqueueLatestProResFrame(_ payload: Data) {
+    private func enqueueLatestProResFrame(_ packet: ProResWirePacket) {
         queue.async { [weak self] in
             guard let self, !self.stopped, self.connectionReady,
-                  self.activeCodec == .proResLT else { return }
+                  self.activeCodec.isProRes else { return }
 
             if self.pendingSends == 0, self.pendingProResFrame == nil {
-                self.sendProResFrameNow(payload)
+                self.sendProResFrameNow(packet)
                 return
             }
 
@@ -1891,21 +1966,31 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.dropsNetThisWindow += 1
                 self.dropsNetTotal += 1
             }
-            self.pendingProResFrame = payload
+            self.pendingProResFrame = packet
         }
     }
 
     /// Must run on `queue`.
-    private func sendProResFrameNow(_ payload: Data) {
-        guard let connection, connectionReady, activeCodec == .proResLT else {
-            pendingProResFrame = payload
+    private func sendProResFrameNow(_ packet: ProResWirePacket) {
+        guard let connection, connectionReady, activeCodec.isProRes else {
+            pendingProResFrame = packet
             return
         }
-        var header = UInt32(payload.count).bigEndian
-        var frame = Data(bytes: &header, count: 4)
-        frame.append(payload)
         pendingSends += 1
-        connection.send(content: frame, completion: .contentProcessed { [weak self] error in
+        let sendStartedAt = ProcessInfo.processInfo.systemUptime
+
+        // Prefix and compressed sample are two writes on the same ordered byte
+        // stream. The second Data is normally a no-copy view onto VideoToolbox's
+        // CMBlockBuffer, so keep `packet` captured until its completion fires.
+        connection.send(content: packet.prefix, completion: .contentProcessed { [weak self] error in
+            guard let self, let error else { return }
+            self.queue.async {
+                guard self.connection === connection else { return }
+                Log.info("ProRes prefix send error: \(error)")
+                connection.cancel()
+            }
+        })
+        connection.send(content: packet.sampleBytes, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
             self.queue.async {
                 // A completion from a retired USB/WiFi socket must not consume
@@ -1916,10 +2001,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     Log.info("ProRes send error: \(error)")
                     return
                 }
-                self.recordSuccessfulVideoSend(byteCount: frame.count)
+                self.proResSendDurationsThisWindow.append(
+                    (ProcessInfo.processInfo.systemUptime - sendStartedAt) * 1000)
+                self.proResFrameBytesThisWindow.append(packet.wireByteCount)
+                self.recordSuccessfulVideoSend(byteCount: packet.wireByteCount)
 
                 if let latest = self.pendingProResFrame,
-                   self.connectionReady, self.activeCodec == .proResLT {
+                   self.connectionReady, self.activeCodec.isProRes {
                     self.pendingProResFrame = nil
                     self.sendProResFrameNow(latest)
                 }
