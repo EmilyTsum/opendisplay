@@ -240,7 +240,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // bottleneck fired. Never encode-then-discard: dropping here avoids wasting
     // VT work on frames that would only add latency.
     private var pendingSends = 0
-    private let maxPendingSends = 3
+    private var maxPendingSends: Int { activeCodec == .proResLT ? 1 : 3 }
+    // ProRes is all-intra: when the wire is busy, retain only the newest
+    // completed compressed frame instead of queuing stale frames behind it.
+    // This slot is intentionally one deep and is drained immediately when the
+    // current Network.framework send completes.
+    private var pendingProResFrame: Data?
     private let pipelineLock = NSLock()
     private var dropsEncThisWindow = 0
     private var dropsNetThisWindow = 0
@@ -676,6 +681,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         stream = nil
         connection?.cancel()
         connection = nil
+        pendingSends = 0
+        pendingProResFrame = nil
         if let encoder { VTCompressionSessionInvalidate(encoder) }
         encoder = nil
         virtualDisplay = nil   // releasing it removes the display
@@ -709,6 +716,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.connection?.cancel()
             self.connection = nil
             self.pendingSends = 0
+            self.pendingProResFrame = nil
             self.pipelineLock.lock()
             self.pendingEncodes = 0
             self.pipelineLock.unlock()
@@ -993,6 +1001,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         connection?.cancel()
         connection = nil
         pendingSends = 0
+        pendingProResFrame = nil
         pipelineLock.lock()
         pendingEncodes = 0
         pipelineLock.unlock()
@@ -1454,7 +1463,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // No receiver, or a pipeline stage is backed up: skip this frame.
         guard connectionReady else { return }
         if shouldDropFrame(reason: "pending_encode") { return }  // encoder busy
-        if shouldDropFrame(reason: "pending_sends") { return }   // TCP send queue full
+        // Inter-frame codecs should avoid spending encode work on a frame we
+        // already know cannot be sent promptly. ProRes is different: every
+        // frame is independently decodable, so its send path keeps a one-deep
+        // latest-wins compressed slot and can safely supersede an older frame.
+        if activeCodec != .proResLT, shouldDropFrame(reason: "pending_sends") { return }
 
         encode(pixelBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), generation: generation)
     }
@@ -1581,7 +1594,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 if let framed = self.proResWireFrame(from: buffer,
                                                       captureMs: capturedAtMs,
                                                       sendMs: sndMs) {
-                    self.sendFramed(framed)
+                    self.enqueueLatestProResFrame(framed)
                 }
             } else if let data = self.annexB(from: buffer) {
                 var framed = Data("{\"cap\":\(capturedAtMs),\"snd\":\(sndMs),\"codec\":\"\(codecAtSubmit.rawValue)\"}".utf8)
@@ -1822,6 +1835,65 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         connection.send(content: frame, completion: .contentProcessed { _ in })
     }
 
+    /// ProRes all-intra send scheduler. Network.framework may retain a large
+    /// Data value until `.contentProcessed` fires; queueing several multi-MB
+    /// ProRes frames would turn bandwidth headroom into visible latency. Keep
+    /// exactly one send in flight and at most one waiting frame. Any newer
+    /// completed frame replaces the waiting one because there is no temporal
+    /// dependency between ProRes frames.
+    private func enqueueLatestProResFrame(_ payload: Data) {
+        queue.async { [weak self] in
+            guard let self, !self.stopped, self.connectionReady,
+                  self.activeCodec == .proResLT else { return }
+
+            if self.pendingSends == 0, self.pendingProResFrame == nil {
+                self.sendProResFrameNow(payload)
+                return
+            }
+
+            // A waiting frame hasn't reached the wire yet, so replacing it is
+            // a true latest-wins drop. Count it as network backpressure so the
+            // existing overlay makes the bottleneck visible.
+            if self.pendingProResFrame != nil {
+                self.dropsNetThisWindow += 1
+                self.dropsNetTotal += 1
+            }
+            self.pendingProResFrame = payload
+        }
+    }
+
+    /// Must run on `queue`.
+    private func sendProResFrameNow(_ payload: Data) {
+        guard let connection, connectionReady, activeCodec == .proResLT else {
+            pendingProResFrame = payload
+            return
+        }
+        var header = UInt32(payload.count).bigEndian
+        var frame = Data(bytes: &header, count: 4)
+        frame.append(payload)
+        pendingSends += 1
+        connection.send(content: frame, completion: .contentProcessed { [weak self] error in
+            guard let self else { return }
+            self.queue.async {
+                // A completion from a retired USB/WiFi socket must not consume
+                // the send slot of its replacement connection.
+                guard self.connection === connection else { return }
+                self.pendingSends = max(0, self.pendingSends - 1)
+                if let error {
+                    Log.info("ProRes send error: \(error)")
+                    return
+                }
+                self.recordSuccessfulVideoSend(byteCount: frame.count)
+
+                if let latest = self.pendingProResFrame,
+                   self.connectionReady, self.activeCodec == .proResLT {
+                    self.pendingProResFrame = nil
+                    self.sendProResFrameNow(latest)
+                }
+            }
+        })
+    }
+
     private func sendFramed(_ payload: Data) {
         guard let connection, connectionReady else { return }
         var header = UInt32(payload.count).bigEndian
@@ -1830,23 +1902,32 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         pendingSends += 1
         connection.send(content: frame, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
-            self.pendingSends -= 1
-            if let error {
-                Log.info("send error: \(error)")
-                return
-            }
-            self.framesSent += 1
-            self.bytesSent += frame.count
-            // Report stats roughly once a second.
-            let elapsed = Date().timeIntervalSince(self.statsWindowStart)
-            if elapsed >= 1.0 {
-                let mbps = Double(self.bytesSent) * 8 / elapsed / 1_000_000
-                let frames = self.framesSent
-                self.bytesSent = 0
-                self.statsWindowStart = Date()
-                Task { @MainActor in self.onStats?(frames, mbps) }
+            self.queue.async {
+                guard self.connection === connection else { return }
+                self.pendingSends = max(0, self.pendingSends - 1)
+                if let error {
+                    Log.info("send error: \(error)")
+                    return
+                }
+                self.recordSuccessfulVideoSend(byteCount: frame.count)
             }
         })
+    }
+
+    /// Must run on `queue`.
+    private func recordSuccessfulVideoSend(byteCount: Int) {
+        framesSent += 1
+        bytesSent += byteCount
+        // Report stats roughly once a second.
+        let elapsed = Date().timeIntervalSince(statsWindowStart)
+        if elapsed >= 1.0 {
+            let mbps = Double(bytesSent) * 8 / elapsed / 1_000_000
+            let frames = framesSent
+            framesSent = 0
+            bytesSent = 0
+            statsWindowStart = Date()
+            Task { @MainActor in self.onStats?(frames, mbps) }
+        }
     }
 
     // MARK: - Helpers
