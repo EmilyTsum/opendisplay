@@ -9,6 +9,49 @@ let deviceKind = UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
 /// Landing page — hosts the Mac app download and explains the two-app setup.
 let macAppURL = URL(string: "https://peetzweg.github.io/opendisplay/")!
 
+/// Measures the cadence Core Animation is actually granting the receiver UI
+/// while streaming and, on ProMotion hardware, explicitly asks for the panel's
+/// full refresh range. This is diagnostic as well as functional: a 120 fps
+/// network stream is not useful if iPadOS has the app compositor at 60 Hz.
+final class DisplayRefreshProbe: NSObject, ObservableObject {
+    @Published private(set) var fps = 0
+
+    private var displayLink: CADisplayLink?
+    private var ticks = 0
+    private var windowStart: CFTimeInterval = 0
+
+    func setActive(_ active: Bool) {
+        if active {
+            guard displayLink == nil else { return }
+            let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
+            let maxHz = Float(UIScreen.main.maximumFramesPerSecond)
+            link.preferredFrameRateRange = CAFrameRateRange(
+                minimum: min(60, maxHz), maximum: maxHz, preferred: maxHz)
+            link.add(to: .main, forMode: .common)
+            displayLink = link
+            ticks = 0
+            windowStart = 0
+        } else {
+            displayLink?.invalidate()
+            displayLink = nil
+            ticks = 0
+            windowStart = 0
+            fps = 0
+        }
+    }
+
+    @objc private func tick(_ link: CADisplayLink) {
+        if windowStart == 0 { windowStart = link.timestamp }
+        ticks += 1
+        let elapsed = link.timestamp - windowStart
+        if elapsed >= 1.0 {
+            fps = Int((Double(ticks) / elapsed).rounded())
+            ticks = 0
+            windowStart = link.timestamp
+        }
+    }
+}
+
 @main
 struct OpenSidecarPhoneApp: App {
     var body: some Scene {
@@ -38,6 +81,7 @@ extension UIWindow {
 struct ReceiverScreen: View {
     @StateObject private var model = ReceiverModel()
     @StateObject private var versionGate = VersionGate()
+    @StateObject private var displayRefresh = DisplayRefreshProbe()
     @State private var showSettings = false
     @State private var showOnboarding = false
     @State private var nagDismissed = false
@@ -81,7 +125,8 @@ struct ReceiverScreen: View {
                         VStack {
                             Spacer()
                             PerfOverlay(stats: model.receiver.perf,
-                                        videoSize: model.receiver.videoSize)
+                                        videoSize: model.receiver.videoSize,
+                                        panelFPS: displayRefresh.fps)
                                 .padding(.bottom, 10)
                         }
                         .allowsHitTesting(false)   // never block touch input
@@ -90,9 +135,15 @@ struct ReceiverScreen: View {
                     IdleView(receiver: model.receiver, showSettings: $showSettings)
                 }
             }
-            .onAppear { model.receiver.setOrientation(portrait: geo.size.height > geo.size.width) }
+            .onAppear {
+                model.receiver.setOrientation(portrait: geo.size.height > geo.size.width)
+                displayRefresh.setActive(isStreaming && scenePhase == .active)
+            }
             .onChange(of: geo.size) { size in
                 model.receiver.setOrientation(portrait: size.height > size.width)
+            }
+            .onChange(of: isStreaming) { streaming in
+                displayRefresh.setActive(streaming && scenePhase == .active)
             }
             .sheet(isPresented: $showOnboarding) {
                 OnboardingView { onboardingDismissed = true }
@@ -128,6 +179,7 @@ struct ReceiverScreen: View {
         }
         .onChange(of: scenePhase) { phase in
             Log.info("scenePhase -> \(String(describing: phase))")
+            displayRefresh.setActive(phase == .active && isStreaming)
             switch phase {
             case .active: model.sceneDidActivate()
             case .background: model.sceneDidBackground()
@@ -310,6 +362,7 @@ struct OnboardingView: View {
 struct PerfOverlay: View {
     let stats: PerfStats
     let videoSize: CGSize
+    let panelFPS: Int
 
     var body: some View {
         VStack(spacing: 8) {
@@ -330,7 +383,11 @@ struct PerfOverlay: View {
                 if stats.e2eP50 > 0 {
                     metric("latency", String(format: "%.0f ms", stats.e2eP50))
                     metric("p95", String(format: "%.0f ms", stats.e2eP95))
-                    metric("encode", String(format: "%.0f ms", stats.encodeP50))
+                    metric("cap→send", String(format: "%.0f ms", stats.encodeP50))
+                }
+                if stats.vtEncodeP50 > 0 {
+                    metric("VT p50", String(format: "%.1f ms", stats.vtEncodeP50))
+                    metric("VT p95", String(format: "%.1f ms", stats.vtEncodeP95))
                 }
                 if stats.decodeP50 > 0 {
                     metric("decode", String(format: "%.1f ms", stats.decodeP50))
@@ -346,9 +403,18 @@ struct PerfOverlay: View {
                     metric("input", String(format: "%.0f ms", stats.inputP50))
                 }
                 metric("rtt", String(format: "%.0f ms", stats.rttMs))
-                metric("FPS", "\(stats.fps)")
+                metric("Rx FPS", "\(stats.fps)")
+                if panelFPS > 0 {
+                    metric("panel Hz", "\(panelFPS)")
+                }
                 if stats.capFps > 0 {
                     metric("Mac cap", "\(stats.capFps)")
+                }
+                if stats.encFps > 0 {
+                    metric("VT out", "\(stats.encFps)")
+                }
+                if stats.encLimit > 0 {
+                    metric("VT flight", "\(stats.encPeak)/\(stats.encLimit)")
                 }
                 metric("Mbit/s", String(format: "%.1f", stats.mbps))
                 metric("stalls", "\(stats.stalls)")
@@ -382,7 +448,9 @@ struct PerfOverlay: View {
                        good: 25, warn: 40, reference: nil))
         graph("frame interval ms",
               BarGraph(samples: stats.samples, ceiling: 60,
-                       good: 25, warn: 50, reference: 16.7))
+                       good: stats.capFps >= 100 ? 12 : 25,
+                       warn: stats.capFps >= 100 ? 20 : 50,
+                       reference: stats.capFps >= 100 ? 8.33 : 16.7))
     }
 
     private func metric(_ label: String, _ value: String) -> some View {

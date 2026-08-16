@@ -187,20 +187,36 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // multiple OpenDisplay monitors apart and persist their arrangement.
     private var displaySerial: UInt32
 
-    // ── Encoder parallelism limiter (maxPendingEncodes = 1) ─────────────────
+    // ── Encoder parallelism limiter ──────────────────────────────────────────
     //
     // VTCompressionSessionEncodeFrame returns immediately; the hardware H.264
     // encoder runs asynchronously. If ScreenCaptureKit delivers the next frame
     // before the previous encode callback fires, VideoToolbox will run multiple
     // encodes in parallel inside the same session.
     //
-    // Capping pendingEncodes at 1 enforces “latest frame wins” on the encoder:
-    // skip captures while an encode is in flight (enc drops), then feed the next
-    // fresh buffer when the callback clears the slot. The H.264 reference chain
-    // stays valid (pre-encode skip → normal P-frame n→n+2); we do NOT force
-    // keyframes on enc drops.
+    // At 60 Hz we keep upstream's strict serialization: it is the best latency
+    // policy for drawing/interaction and prevents VideoToolbox from building an
+    // invisible queue. At 120 Hz, however, a perfectly ordinary 9–15 ms encoder
+    // callback straddles the next 8.33 ms capture and a one-slot gate deterministically
+    // rejects roughly every other frame, pinning delivery near 60 fps even when the
+    // hardware can pipeline two frames. The original 120 Hz backpressure experiment
+    // used a two-frame bound for exactly this reason. Keep that extra slot ONLY for
+    // high-refresh mode; the queue is still tightly bounded so latency cannot grow
+    // without limit.
     private var pendingEncodes = 0
-    private let maxPendingEncodes = 1
+    private var maxPendingEncodes: Int {
+        // Diagnostic escape hatch: 1...3. Missing/zero means automatic.
+        let override = UserDefaults.standard.integer(forKey: "encoderInflight")
+        if override > 0 { return min(max(override, 1), 3) }
+        return activeFrameRate >= 100 ? 2 : 1
+    }
+
+    // Per-window encoder telemetry. capFps tells us what ScreenCaptureKit supplied;
+    // these counters tell us what VideoToolbox actually completed, independently of
+    // receiver/display pacing.
+    private var encodeOutputsThisWindow = 0
+    private var encodeDurationsThisWindow: [Double] = []
+    private var maxEncodeInflightThisWindow = 0
 
     // ── Outstanding send backpressure (maxPendingSends = 3) ──────────────────
     //
@@ -991,10 +1007,27 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 let capFps = elapsed > 0 ? Int(Double(self.capFrames) / elapsed) : 0
                 self.capFrames = 0
                 self.capWindowStart = Date()
+
+                // Snapshot encoder completion telemetry under the same lock as
+                // pendingEncodes; callbacks arrive on VideoToolbox threads.
+                self.pipelineLock.lock()
+                let encodeOutputs = self.encodeOutputsThisWindow
+                let encodeDurations = self.encodeDurationsThisWindow
+                let encodeInflightPeak = self.maxEncodeInflightThisWindow
+                let encodeInflightNow = self.pendingEncodes
+                self.encodeOutputsThisWindow = 0
+                self.encodeDurationsThisWindow.removeAll(keepingCapacity: true)
+                self.maxEncodeInflightThisWindow = self.pendingEncodes
+                self.pipelineLock.unlock()
+                let encFps = elapsed > 0 ? Int(Double(encodeOutputs) / elapsed) : 0
+                let encSorted = encodeDurations.sorted()
+                let enc50 = encSorted.isEmpty ? 0 : encSorted[encSorted.count / 2]
+                let enc95 = encSorted.isEmpty ? 0 : encSorted[min(encSorted.count - 1, Int(Double(encSorted.count) * 0.95))]
+
                 let sorted = self.inputLatencies.sorted()
                 let inp50 = sorted.isEmpty ? 0 : sorted[sorted.count / 2].rounded()
                 let inp95 = sorted.isEmpty ? 0 : sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.95))].rounded()
-                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps)}")
+                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps),\"encFps\":\(encFps),\"encMs50\":\(enc50),\"encMs95\":\(enc95),\"encInFlight\":\(encodeInflightNow),\"encPeak\":\(encodeInflightPeak),\"encLimit\":\(self.maxPendingEncodes)}")
             }
             self.schedulePing()
         }
@@ -1464,8 +1497,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, generation: UInt64) {
         guard generation == captureGenerationNow, let encoder else { return }
+        let encodeStartedAt = ProcessInfo.processInfo.systemUptime
         pipelineLock.lock()
         pendingEncodes += 1
+        maxEncodeInflightThisWindow = max(maxEncodeInflightThisWindow, pendingEncodes)
         pipelineLock.unlock()
         let capturedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
         var frameProperties: CFDictionary?
@@ -1482,11 +1517,18 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             infoFlagsOut: nil
         ) { [weak self] status, _, buffer in
             guard let self else { return }
-            defer {
-                self.pipelineLock.lock()
-                self.pendingEncodes = max(0, self.pendingEncodes - 1)
-                self.pipelineLock.unlock()
+            let encodeMs = (ProcessInfo.processInfo.systemUptime - encodeStartedAt) * 1000
+            // Free the encoder slot as soon as VideoToolbox produces output,
+            // before Annex-B conversion/network framing. At 120 Hz even a small
+            // amount of callback-side bookkeeping can otherwise make the gate
+            // reject the next 8.33 ms capture unnecessarily.
+            self.pipelineLock.lock()
+            self.pendingEncodes = max(0, self.pendingEncodes - 1)
+            if status == noErr, buffer != nil {
+                self.encodeOutputsThisWindow += 1
+                self.encodeDurationsThisWindow.append(encodeMs)
             }
+            self.pipelineLock.unlock()
             guard status == noErr, let buffer else {
                 // A session rejecting every frame looks healthy in all other
                 // counters — the receiver just stays black. Don't be silent.

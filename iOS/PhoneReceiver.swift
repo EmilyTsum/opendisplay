@@ -38,6 +38,12 @@ struct PerfStats: Equatable {
     var inputP50 = 0.0           // touch sent → CGEvent injected on the Mac, ms
     var inputP95 = 0.0
     var capFps = 0               // frames ScreenCaptureKit delivered on the Mac
+    var encFps = 0               // frames VideoToolbox completed on the Mac
+    var vtEncodeP50 = 0.0        // VT callback latency, capture submit → output
+    var vtEncodeP95 = 0.0
+    var encInFlight = 0          // current VT in-flight count at last Mac ping
+    var encPeak = 0              // peak VT in-flight count in the last Mac window
+    var encLimit = 0             // active sender backpressure limit (1 at 60, 2 at 120)
     // Metal renderer path only:
     var decodeP50 = 0.0          // VTDecompressionSession decode, ms
     var photonP50 = 0.0          // Mac capture → frame actually on glass, ms
@@ -104,6 +110,12 @@ final class PhoneReceiver: ObservableObject {
     private var macInputP50 = 0.0
     private var macInputP95 = 0.0
     private var macCapFps = 0
+    private var macEncFps = 0
+    private var macVTEncodeP50 = 0.0
+    private var macVTEncodeP95 = 0.0
+    private var macEncInFlight = 0
+    private var macEncPeak = 0
+    private var macEncLimit = 0
 
     private var nowMs: Double { Date().timeIntervalSince1970 * 1000 }
 
@@ -433,6 +445,12 @@ final class PhoneReceiver: ObservableObject {
             macInputP50 = obj["inp50"] as? Double ?? macInputP50
             macInputP95 = obj["inp95"] as? Double ?? macInputP95
             macCapFps = obj["capFps"] as? Int ?? macCapFps
+            macEncFps = obj["encFps"] as? Int ?? macEncFps
+            macVTEncodeP50 = obj["encMs50"] as? Double ?? macVTEncodeP50
+            macVTEncodeP95 = obj["encMs95"] as? Double ?? macVTEncodeP95
+            macEncInFlight = obj["encInFlight"] as? Int ?? macEncInFlight
+            macEncPeak = obj["encPeak"] as? Int ?? macEncPeak
+            macEncLimit = obj["encLimit"] as? Int ?? macEncLimit
         case "cursor":
             let visible = (obj["v"] as? Int ?? 0) == 1
             let x = obj["x"] as? Double ?? 0
@@ -888,6 +906,12 @@ final class PhoneReceiver: ObservableObject {
             stats.inputP50 = macInputP50
             stats.inputP95 = macInputP95
             stats.capFps = macCapFps
+            stats.encFps = macEncFps
+            stats.vtEncodeP50 = macVTEncodeP50
+            stats.vtEncodeP95 = macVTEncodeP95
+            stats.encInFlight = macEncInFlight
+            stats.encPeak = macEncPeak
+            stats.encLimit = macEncLimit
             stats.decodeP50 = percentile(decodeWindow, 0.5)
             stats.photonP50 = percentile(photonWindow, 0.5)
             stats.photonP95 = percentile(photonWindow, 0.95)
