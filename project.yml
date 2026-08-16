@@ -94,6 +94,7 @@ targets:
     sources:
       - MacTests
       - Mac/DisplayArrangement.swift
+      - Mac/DisplayIdentity.swift
       - Mac/Log.swift
       - Mac/LogPolicies.swift
     settings:

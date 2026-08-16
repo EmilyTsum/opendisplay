@@ -1,5 +1,4 @@
 import XCTest
-@testable import OpenSidecarMac
 
 final class DisplayIdentityTests: XCTestCase {
     private var defaults: UserDefaults!
