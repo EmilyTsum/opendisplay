@@ -95,6 +95,7 @@ targets:
       - MacTests
       - Mac/DisplayArrangement.swift
       - Mac/DisplayIdentity.swift
+      - Mac/USBLinkInfo.swift
       - Mac/Log.swift
       - Mac/LogPolicies.swift
     settings:

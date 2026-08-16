@@ -404,6 +404,9 @@ struct PerfOverlay: View {
                 }
                 metric("rtt", String(format: "%.0f ms", stats.rttMs))
                 metric("Rx FPS", "\(stats.fps)")
+                if stats.transport == "USB", !stats.usbLink.isEmpty {
+                    metric("USB link", stats.usbLink)
+                }
                 if panelFPS > 0 {
                     metric("panel Hz", "\(panelFPS)")
                 }

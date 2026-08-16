@@ -214,6 +214,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private let refreshRatePreference: RefreshRatePreference
     private var activeCodec: StreamCodec = .h264
     private var activeFrameRate = 60
+    // Physical USB enumeration speed, independent from the throughput we
+    // observe through usbmux/TCP. Probed off-thread when a USB socket becomes
+    // ready and surfaced to the receiver HUD for cable/link diagnosis.
+    private var usbLinkInfo: USBLinkInfo?
+    private var usbLinkProbeGeneration = 0
+    private var connectedUSBUDID: String?
     // Stable per-device serial for the virtual display, so macOS can tell
     // multiple OpenDisplay monitors apart and persist their arrangement.
     private var displaySerial: UInt32
@@ -775,6 +781,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             let label = if case .usb = newTransport { "USB" } else { "WiFi" }
             Log.info("switching \(self.endpointName) to \(label)")
             self.transport = newTransport
+            self.usbLinkProbeGeneration += 1
+            self.usbLinkInfo = nil
+            self.connectedUSBUDID = nil
             // Fresh grace window: if the new link can't come up either, the
             // session ends like any other disconnect instead of dialing
             // a dead transport forever.
@@ -934,11 +943,42 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         lastCursorPNGHash = 0
         lastCursorSent = (-1, -1, false)
         lastReceived = Date()  // fresh grace period for the watchdog
+        refreshUSBLinkInfo()
         receiveControl(on: conn)
         Task { await self.status("Connected to \(self.endpointName)") }
     }
 
+    /// Query macOS for the physical USB enumeration speed without ever
+    /// blocking the sender/capture queue. A stale result is discarded if the
+    /// session switches transport or redials while system_profiler is running.
+    private func refreshUSBLinkInfo() {
+        usbLinkProbeGeneration += 1
+        let probeGeneration = usbLinkProbeGeneration
+        guard case .usb = transport,
+              let udid = connectedUSBUDID, !udid.isEmpty else {
+            usbLinkInfo = nil
+            return
+        }
+        Task { [weak self] in
+            let info = await USBLinkInfo.detect(udid: udid)
+            self?.queue.async { [weak self] in
+                guard let self,
+                      probeGeneration == self.usbLinkProbeGeneration,
+                      case .usb = self.transport,
+                      self.connectedUSBUDID == udid else { return }
+                self.usbLinkInfo = info
+                if let info {
+                    Log.info("physical USB link: \(info.hudLabel) (device \(udid.prefix(8))…)")
+                } else {
+                    Log.info("physical USB link speed unavailable for device \(udid.prefix(8))…")
+                }
+            }
+        }
+    }
+
     private func connectTCP(_ endpoint: NWEndpoint) {
+        connectedUSBUDID = nil
+        usbLinkInfo = nil
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
         let params = NWParameters(tls: nil, tcp: options)
@@ -999,12 +1039,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         Task { [weak self] in
             guard let self else { return }
             do {
-                let conn = try await Usbmux.dial(udid: udid, port: port, queue: queue)
+                let (conn, device) = try await Usbmux.dial(udid: udid, port: port, queue: queue)
                 queue.async {
                     guard generation == self.dialGeneration, !self.stopped else {
                         conn.cancel()
                         return
                     }
+                    self.connectedUSBUDID = device.udid
                     self.connection = conn
                     conn.stateUpdateHandler = { [weak self] state in
                         guard let self else { return }
@@ -1120,7 +1161,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 let sorted = self.inputLatencies.sorted()
                 let inp50 = sorted.isEmpty ? 0 : sorted[sorted.count / 2].rounded()
                 let inp95 = sorted.isEmpty ? 0 : sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.95))].rounded()
-                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps),\"encFps\":\(encFps),\"encMs50\":\(enc50),\"encMs95\":\(enc95),\"encInFlight\":\(encodeInflightNow),\"encPeak\":\(encodeInflightPeak),\"encLimit\":\(self.maxPendingEncodes),\"wireMs50\":\(wire50),\"wireMs95\":\(wire95),\"frameKB\":\(frameKB)}")
+                let usbMbps = self.usbLinkInfo?.megabitsPerSecond ?? 0
+                let usbLink = self.usbLinkInfo?.hudLabel ?? ""
+                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps),\"encFps\":\(encFps),\"encMs50\":\(enc50),\"encMs95\":\(enc95),\"encInFlight\":\(encodeInflightNow),\"encPeak\":\(encodeInflightPeak),\"encLimit\":\(self.maxPendingEncodes),\"wireMs50\":\(wire50),\"wireMs95\":\(wire95),\"frameKB\":\(frameKB),\"usbMbps\":\(usbMbps),\"usbLink\":\"\(usbLink)\"}")
             }
             self.schedulePing()
         }

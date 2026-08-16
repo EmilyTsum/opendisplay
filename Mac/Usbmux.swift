@@ -91,11 +91,11 @@ enum Usbmux {
     /// Resolve a device (specific udid, or the first wired one) and connect
     /// to `port` on it. One-shot — callers own the retry loop.
     static func dial(udid: String?, port: UInt16,
-                     queue: DispatchQueue) async throws -> NWConnection {
+                     queue: DispatchQueue) async throws -> (NWConnection, UsbmuxDevice) {
         let devices = try await listDevices(queue: queue)
         let device = udid.map { u in devices.first { $0.udid == u } } ?? devices.first
         guard let device else { throw Failure.noDevice }
-        return try await connect(deviceID: device.deviceID, port: port, queue: queue)
+        return (try await connect(deviceID: device.deviceID, port: port, queue: queue), device)
     }
 
     /// Best-effort friendly name ("Philip's iPhone") from lockdownd, which

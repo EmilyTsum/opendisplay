@@ -44,6 +44,8 @@ struct PerfStats: Equatable {
     var encInFlight = 0          // current VT in-flight count at last Mac ping
     var encPeak = 0              // peak VT in-flight count in the last Mac window
     var encLimit = 0             // active sender backpressure limit (1 at 60, 2 at 120)
+    var usbLink = ""             // physical USB enumeration speed from macOS
+    var usbMbps = 0              // 480 / 5000 / 10000 / ...; 0 when unknown/WiFi
     var wireSendP50 = 0.0        // ProRes Network.framework completion latency
     var wireSendP95 = 0.0
     var wireFrameKB = 0.0        // average compressed ProRes frame size
@@ -118,6 +120,8 @@ final class PhoneReceiver: ObservableObject {
     private var macEncInFlight = 0
     private var macEncPeak = 0
     private var macEncLimit = 0
+    private var macUSBLink = ""
+    private var macUSBMbps = 0
     private var macWireSendP50 = 0.0
     private var macWireSendP95 = 0.0
     private var macWireFrameKB = 0.0
@@ -465,6 +469,8 @@ final class PhoneReceiver: ObservableObject {
             macEncInFlight = obj["encInFlight"] as? Int ?? macEncInFlight
             macEncPeak = obj["encPeak"] as? Int ?? macEncPeak
             macEncLimit = obj["encLimit"] as? Int ?? macEncLimit
+            macUSBLink = obj["usbLink"] as? String ?? macUSBLink
+            macUSBMbps = obj["usbMbps"] as? Int ?? macUSBMbps
             macWireSendP50 = obj["wireMs50"] as? Double ?? macWireSendP50
             macWireSendP95 = obj["wireMs95"] as? Double ?? macWireSendP95
             macWireFrameKB = obj["frameKB"] as? Double ?? macWireFrameKB
@@ -1061,6 +1067,8 @@ final class PhoneReceiver: ObservableObject {
             stats.encInFlight = macEncInFlight
             stats.encPeak = macEncPeak
             stats.encLimit = macEncLimit
+            stats.usbLink = macUSBLink
+            stats.usbMbps = macUSBMbps
             stats.wireSendP50 = macWireSendP50
             stats.wireSendP95 = macWireSendP95
             stats.wireFrameKB = macWireFrameKB
