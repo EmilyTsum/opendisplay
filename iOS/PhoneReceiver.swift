@@ -185,9 +185,15 @@ final class PhoneReceiver: ObservableObject {
     }()
 
     private var supportedCodecNames: [String] {
-        VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
-            ? [StreamCodec.hevc.rawValue, StreamCodec.h264.rawValue]
-            : [StreamCodec.h264.rawValue]
+        var codecs: [String] = []
+        if VTIsHardwareDecodeSupported(kCMVideoCodecType_AppleProRes422LT) {
+            codecs.append(StreamCodec.proResLT.rawValue)
+        }
+        if VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC) {
+            codecs.append(StreamCodec.hevc.rawValue)
+        }
+        codecs.append(StreamCodec.h264.rawValue)
+        return codecs
     }
 
     private var advertisedService: NWListener.Service {
@@ -641,6 +647,19 @@ final class PhoneReceiver: ObservableObject {
             return
         }
 
+        // Protocol-additive ProRes sample framing. H.264/HEVC continue through
+        // the legacy Annex-B parser below unchanged.
+        if data.count >= 8, data.prefix(4) == Data("ODPR".utf8) {
+            let metaLength = data[4..<8].withUnsafeBytes {
+                Int(UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self)))
+            }
+            guard metaLength >= 0, data.count >= 8 + metaLength else { return }
+            let metaData = Data(data[8..<(8 + metaLength)])
+            let sampleData = Data(data[(8 + metaLength)...])
+            handleProResFrame(metaData: metaData, sampleData: sampleData)
+            return
+        }
+
         // Split on 4-byte start codes (our sender only emits 00 00 00 01).
         // Bytes before the FIRST start code are the telemetry prefix
         // ({"cap":…,"snd":…} stamped by the Mac).
@@ -723,6 +742,83 @@ final class PhoneReceiver: ObservableObject {
         }
         guard !vclNALUs.isEmpty else { return }
         enqueueFrame(vclNALUs, captureMs: captureMs, sendMs: sendMs)
+    }
+
+    /// Receives one complete ProRes compressed sample. ProRes is intra-frame
+    /// and has no Annex-B parameter-set stream, so the sender includes the
+    /// encoded dimensions in the small metadata header and CoreMedia can build
+    /// the matching video format description directly.
+    private func handleProResFrame(metaData: Data, sampleData: Data) {
+        guard !renderingPaused, !sampleData.isEmpty,
+              let meta = try? JSONSerialization.jsonObject(with: metaData) as? [String: Any],
+              let codecRaw = meta["codec"] as? String,
+              codecRaw == StreamCodec.proResLT.rawValue,
+              let width = (meta["w"] as? NSNumber)?.int32Value,
+              let height = (meta["h"] as? NSNumber)?.int32Value,
+              width > 0, height > 0 else { return }
+
+        let captureMs = (meta["cap"] as? NSNumber)?.doubleValue
+        let sendMs = (meta["snd"] as? NSNumber)?.doubleValue
+
+        var needsFormat = streamCodec != .proResLT || formatDesc == nil
+        if let formatDesc {
+            let dims = CMVideoFormatDescriptionGetDimensions(formatDesc)
+            needsFormat = needsFormat || dims.width != width || dims.height != height
+        }
+        if needsFormat {
+            streamCodec = .proResLT
+            vps = nil
+            sps = nil
+            pps = nil
+            formatDesc = nil
+            displayLayer.flush()
+            var desc: CMVideoFormatDescription?
+            let status = CMVideoFormatDescriptionCreate(
+                allocator: kCFAllocatorDefault,
+                codecType: kCMVideoCodecType_AppleProRes422LT,
+                width: width,
+                height: height,
+                extensions: nil,
+                formatDescriptionOut: &desc)
+            formatDesc = desc
+            finishFormatDescription(status)
+            Log.info("stream codec changed -> \(StreamCodec.proResLT.displayName)")
+        }
+        guard let formatDesc else { return }
+
+        var blockBuffer: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(
+                allocator: kCFAllocatorDefault,
+                memoryBlock: nil,
+                blockLength: sampleData.count,
+                blockAllocator: kCFAllocatorDefault,
+                customBlockSource: nil,
+                offsetToData: 0,
+                dataLength: sampleData.count,
+                flags: 0,
+                blockBufferOut: &blockBuffer) == noErr,
+              let blockBuffer else { return }
+        let copyStatus = sampleData.withUnsafeBytes { raw in
+            CMBlockBufferReplaceDataBytes(
+                with: raw.baseAddress!, blockBuffer: blockBuffer,
+                offsetIntoDestination: 0, dataLength: sampleData.count)
+        }
+        guard copyStatus == noErr else { return }
+
+        var sample: CMSampleBuffer?
+        var size = sampleData.count
+        let status = CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: blockBuffer,
+            formatDescription: formatDesc,
+            sampleCount: 1,
+            sampleTimingEntryCount: 0,
+            sampleTimingArray: nil,
+            sampleSizeEntryCount: 1,
+            sampleSizeArray: &size,
+            sampleBufferOut: &sample)
+        guard status == noErr, let sample else { return }
+        presentSample(sample, captureMs: captureMs, sendMs: sendMs)
     }
 
     private func finishFormatDescription(_ status: OSStatus) {
@@ -830,7 +926,14 @@ final class PhoneReceiver: ObservableObject {
             sampleBufferOut: &sample)
 
         guard let sample else { return }
+        presentSample(sample, captureMs: captureMs, sendMs: sendMs)
+    }
 
+    /// Common decode/display/telemetry path for both Annex-B (H.264/HEVC)
+    /// and complete compressed samples (ProRes).
+    private func presentSample(_ sample: CMSampleBuffer,
+                               captureMs: Double? = nil,
+                               sendMs: Double? = nil) {
         if loggedDisplayPath != (useMetalPath && onDecodedFrame != nil) {
             loggedDisplayPath = useMetalPath && onDecodedFrame != nil
             Log.info("display path: metal=\(useMetalPath) sink=\(onDecodedFrame != nil)")

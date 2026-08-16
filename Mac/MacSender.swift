@@ -52,6 +52,7 @@ enum StreamQuality: String, CaseIterable {
         case (.best, .h264): base = 48_000_000
         case (.balanced, .h264): base = 28_000_000
         case (.fast, .h264): base = 14_000_000
+        case (_, .proResLT): base = 0 // fixed-quality intraframe codec; VT owns rate
         }
         return frameRate >= 100 ? Int(Double(base) * 1.5) : base
     }
@@ -75,20 +76,24 @@ enum StreamQuality: String, CaseIterable {
 
 
 enum CodecPreference: String, CaseIterable {
-    case auto, hevc, h264
+    case auto, hevc, h264, proResLT
 
     var label: String {
         switch self {
         case .auto: return "Auto (HEVC preferred)"
         case .hevc: return "HEVC"
         case .h264: return "H.264"
+        case .proResLT: return "ProRes 422 LT (experimental)"
         }
     }
 
-    func resolved(peerSupportsHEVC: Bool) -> StreamCodec {
+    func resolved(peerSupportsHEVC: Bool, peerSupportsProResLT: Bool) -> StreamCodec {
         switch self {
         case .h264: return .h264
         case .auto, .hevc: return peerSupportsHEVC ? .hevc : .h264
+        case .proResLT:
+            if peerSupportsProResLT { return .proResLT }
+            return peerSupportsHEVC ? .hevc : .h264
         }
     }
 }
@@ -134,6 +139,10 @@ struct PhoneInfo: Decodable {
     var supportsHEVC: Bool {
         protocolVersion >= WireProtocol.mediaCapabilitiesVersion
             && (codecs?.contains(StreamCodec.hevc.rawValue) ?? false)
+    }
+    var supportsProResLT: Bool {
+        protocolVersion >= WireProtocol.mediaCapabilitiesVersion
+            && (codecs?.contains(StreamCodec.proResLT.rawValue) ?? false)
     }
 }
 
@@ -430,7 +439,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// rotates (it re-sends hello with swapped dimensions).
     private func setupExtend(_ info: PhoneInfo) async throws {
         activeFrameRate = refreshRatePreference.resolved(deviceMaximum: info.maximumFrameRate)
-        activeCodec = codecPreference.resolved(peerSupportsHEVC: info.supportsHEVC)
+        activeCodec = codecPreference.resolved(
+            peerSupportsHEVC: info.supportsHEVC,
+            peerSupportsProResLT: info.supportsProResLT)
         // USB session IDs are based on the hardware UDID while WiFi IDs are
         // based on Bonjour names. Deriving the display serial from either made
         // the *same iPad* become two different virtual monitors depending on
@@ -1331,10 +1342,18 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// encoder that supports low-latency rate control.
     private func createCompressionSession(width: Int, height: Int,
                                           codec: StreamCodec, lowLatency: Bool) -> OSStatus {
-        let spec: CFDictionary? = lowLatency
+        // Apple's low-latency rate-control encoder specification is for the
+        // inter-frame codecs. ProRes is intra-only and should be created with
+        // the normal encoder specification.
+        let spec: CFDictionary? = lowLatency && codec != .proResLT
             ? [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue] as CFDictionary
             : nil
-        let codecType = codec == .hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264
+        let codecType: CMVideoCodecType
+        switch codec {
+        case .h264: codecType = kCMVideoCodecType_H264
+        case .hevc: codecType = kCMVideoCodecType_HEVC
+        case .proResLT: codecType = kCMVideoCodecType_AppleProRes422LT
+        }
         return VTCompressionSessionCreate(
             allocator: nil,
             width: Int32(width), height: Int32(height),
@@ -1357,7 +1376,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             var status = createCompressionSession(width: width, height: height,
                                                   codec: codec, lowLatency: lowLatency)
             var usedFallback = false
-            if encoder == nil, lowLatency {
+            if encoder == nil, lowLatency, codec != .proResLT {
                 Log.info("VTCompressionSessionCreate \(codec.displayName) failed with low-latency RC (status \(status)) — retrying normally")
                 status = createCompressionSession(width: width, height: height,
                                                   codec: codec, lowLatency: false)
@@ -1367,13 +1386,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
 
         var (status, usedLowLatencyFallback) = create(activeCodec)
-        if encoder == nil, activeCodec == .hevc {
-            // Capability negotiation says the receiver can decode HEVC, but
-            // the Mac encoder can still reject it (old/odd hardware). Keep the
-            // session usable rather than failing the whole display.
-            Log.info("HEVC encoder unavailable (status \(status)) — falling back to H.264")
-            activeCodec = .h264
-            (status, usedLowLatencyFallback) = create(.h264)
+        if encoder == nil, activeCodec != .h264 {
+            // Capability negotiation says the receiver can decode the selected
+            // codec, but the Mac encoder can still reject it. ProRes first falls
+            // back to HEVC when possible; HEVC itself falls back to H.264.
+            if activeCodec == .proResLT, lastHello?.supportsHEVC == true {
+                Log.info("ProRes LT encoder unavailable (status \(status)) — falling back to HEVC")
+                activeCodec = .hevc
+                (status, usedLowLatencyFallback) = create(.hevc)
+            }
+            if encoder == nil {
+                Log.info("\(activeCodec.displayName) encoder unavailable (status \(status)) — falling back to H.264")
+                activeCodec = .h264
+                (status, usedLowLatencyFallback) = create(.h264)
+            }
         }
         guard let encoder else {
             Log.info("FATAL: VTCompressionSessionCreate failed (status \(status))")
@@ -1385,22 +1411,27 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        let profile: CFString = activeCodec == .hevc
-            ? kVTProfileLevel_HEVC_Main_AutoLevel
-            : kVTProfileLevel_H264_High_AutoLevel
-        VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_ProfileLevel, value: profile)
-        VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                             value: (frameRate * 60) as CFNumber)
-        VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
-                             value: 60 as CFNumber)
+        if activeCodec != .proResLT {
+            let profile: CFString = activeCodec == .hevc
+                ? kVTProfileLevel_HEVC_Main_AutoLevel
+                : kVTProfileLevel_H264_High_AutoLevel
+            VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_ProfileLevel, value: profile)
+            VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
+                                 value: (frameRate * 60) as CFNumber)
+            VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+                                 value: 60 as CFNumber)
+        }
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
         let bitrate = quality.bitrate(codec: activeCodec, frameRate: frameRate)
-        VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
+        if bitrate > 0 {
+            VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
+        }
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: frameRate as CFNumber)
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
                              value: kCFBooleanTrue)
         VTCompressionSessionPrepareToEncodeFrames(encoder)
-        Log.info("encoder ready: \(width)x\(height) \(activeCodec.displayName) \(bitrate / 1_000_000)Mbps \(frameRate)fps quality=\(quality.rawValue) lowLatencyRC=\(lowLatency && !usedLowLatencyFallback)\(usedLowLatencyFallback ? " (fallback)" : "")")
+        let rateLabel = bitrate > 0 ? "\(bitrate / 1_000_000)Mbps" : "fixed-quality"
+        Log.info("encoder ready: \(width)x\(height) \(activeCodec.displayName) \(rateLabel) \(frameRate)fps quality=\(quality.rawValue) lowLatencyRC=\(activeCodec != .proResLT && lowLatency && !usedLowLatencyFallback)\(usedLowLatencyFallback ? " (fallback)" : "")")
     }
 
     // MARK: - Capture callback
@@ -1497,6 +1528,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, generation: UInt64) {
         guard generation == captureGenerationNow, let encoder else { return }
+        let codecAtSubmit = activeCodec
         let encodeStartedAt = ProcessInfo.processInfo.systemUptime
         pipelineLock.lock()
         pendingEncodes += 1
@@ -1505,7 +1537,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let capturedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
         var frameProperties: CFDictionary?
         if needsKeyframe {
-            frameProperties = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as CFDictionary
+            if codecAtSubmit != .proResLT {
+                frameProperties = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as CFDictionary
+            }
             needsKeyframe = false
         }
         let submitStatus = VTCompressionSessionEncodeFrame(
@@ -1542,9 +1576,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 return
             }
             guard generation == self.captureGenerationNow else { return }
-            if let data = self.annexB(from: buffer) {
-                let sndMs = Int64(Date().timeIntervalSince1970 * 1000)
-                var framed = Data("{\"cap\":\(capturedAtMs),\"snd\":\(sndMs),\"codec\":\"\(self.activeCodec.rawValue)\"}".utf8)
+            let sndMs = Int64(Date().timeIntervalSince1970 * 1000)
+            if codecAtSubmit == .proResLT {
+                if let framed = self.proResWireFrame(from: buffer,
+                                                      captureMs: capturedAtMs,
+                                                      sendMs: sndMs) {
+                    self.sendFramed(framed)
+                }
+            } else if let data = self.annexB(from: buffer) {
+                var framed = Data("{\"cap\":\(capturedAtMs),\"snd\":\(sndMs),\"codec\":\"\(codecAtSubmit.rawValue)\"}".utf8)
                 framed.append(data)
                 self.sendFramed(framed)
             }
@@ -1702,6 +1742,48 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let arr = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false),
               let dict = (arr as? [[CFString: Any]])?.first else { return true }
         return !(dict[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
+    }
+
+    // MARK: - ProRes sample framing
+
+    /// ProRes is not NAL/Annex-B. New receivers get one complete compressed
+    /// CMSampleBuffer payload with a tiny self-describing header:
+    /// ["ODPR"][u32 metadata length][JSON metadata][ProRes sample bytes].
+    /// The outer OpenDisplay u32 frame length remains unchanged, so old codecs
+    /// and all control messages keep their existing wire format.
+    private func proResWireFrame(from sample: CMSampleBuffer,
+                                 captureMs: Int64,
+                                 sendMs: Int64) -> Data? {
+        guard let block = CMSampleBufferGetDataBuffer(sample),
+              let format = CMSampleBufferGetFormatDescription(sample) else { return nil }
+        let total = CMBlockBufferGetDataLength(block)
+        guard total > 0 else { return nil }
+
+        let dims = CMVideoFormatDescriptionGetDimensions(format)
+        let meta: [String: Any] = [
+            "cap": captureMs,
+            "snd": sendMs,
+            "codec": StreamCodec.proResLT.rawValue,
+            "w": Int(dims.width),
+            "h": Int(dims.height),
+        ]
+        guard let metaData = try? JSONSerialization.data(withJSONObject: meta),
+              metaData.count <= Int(UInt32.max) else { return nil }
+
+        var sampleData = Data(count: total)
+        let copyStatus = sampleData.withUnsafeMutableBytes { raw in
+            return CMBlockBufferCopyDataBytes(block, atOffset: 0,
+                                              dataLength: total,
+                                              destination: raw.baseAddress!)
+        }
+        guard copyStatus == noErr else { return nil }
+
+        var out = Data("ODPR".utf8)
+        var metaLength = UInt32(metaData.count).bigEndian
+        out.append(Data(bytes: &metaLength, count: 4))
+        out.append(metaData)
+        out.append(sampleData)
+        return out
     }
 
     // MARK: - Wire framing: [4-byte big-endian length][payload]

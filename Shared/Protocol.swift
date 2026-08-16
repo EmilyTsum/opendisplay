@@ -37,8 +37,15 @@ enum WireProtocol {
 enum StreamCodec: String, Codable, CaseIterable {
     case h264
     case hevc
+    case proResLT = "proresLT"
 
-    var displayName: String { self == .hevc ? "HEVC" : "H.264" }
+    var displayName: String {
+        switch self {
+        case .h264: return "H.264"
+        case .hevc: return "HEVC"
+        case .proResLT: return "ProRes 422 LT"
+        }
+    }
 }
 
 enum WireMessage {
