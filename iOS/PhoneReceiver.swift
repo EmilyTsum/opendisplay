@@ -845,7 +845,7 @@ final class PhoneReceiver: ObservableObject {
         // for the ProRes sample slice.
         let copyStatus = wireData.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return kCMBlockBufferBadCustomBlockSourceErr }
-            CMBlockBufferReplaceDataBytes(
+            return CMBlockBufferReplaceDataBytes(
                 with: base.advanced(by: sampleOffset), blockBuffer: blockBuffer,
                 offsetIntoDestination: 0, dataLength: sampleLength)
         }
