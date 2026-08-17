@@ -81,7 +81,11 @@ struct PhoneInfo: Decodable {
 /// How the sender reaches the receiver. Reconnects re-dial from scratch, so
 /// a USB device that was replugged (new usbmuxd DeviceID) is found again.
 enum SenderTransport {
-    case tcp(NWEndpoint)                   // WiFi (Bonjour) or -host/-port override
+    /// Bonjour/TCP or a manual host endpoint. When `requiredInterface` is an
+    /// AWDL interface discovered by NWBrowser, Network.framework is asked to
+    /// keep this connection on the peer-to-peer link instead of resolving the
+    /// same Bonjour service back through the infrastructure AP.
+    case tcp(NWEndpoint, requiredInterface: NWInterface?)
     case usb(udid: String?, port: UInt16)  // native usbmuxd dial; nil = first device
 }
 
@@ -583,7 +587,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     func switchTransport(to newTransport: SenderTransport) {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
-            let label = if case .usb = newTransport { "USB" } else { "WiFi" }
+            let label: String
+            switch newTransport {
+            case .usb:
+                label = "USB"
+            case .tcp(_, let requiredInterface):
+                label = requiredInterface == nil ? "WiFi" : "AWDL"
+            }
             Log.info("switching \(self.endpointName) to \(label)")
             self.transport = newTransport
             // Fresh grace window: if the new link can't come up either, the
@@ -723,7 +733,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func connect() {
         guard !stopped else { return }
         switch transport {
-        case .tcp(let endpoint): connectTCP(endpoint)
+        case .tcp(let endpoint, let requiredInterface):
+            connectTCP(endpoint, requiredInterface: requiredInterface)
         case .usb(let udid, let port): connectUSB(udid: udid, port: port)
         }
     }
@@ -752,10 +763,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         Task { await self.status("Connected to \(self.endpointName)") }
     }
 
-    private func connectTCP(_ endpoint: NWEndpoint) {
+    private func connectTCP(_ endpoint: NWEndpoint, requiredInterface: NWInterface?) {
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
         let params = NWParameters(tls: nil, tcp: options)
+        // Apple peer-to-peer Wi-Fi (AWDL) is exposed through the public
+        // Network.framework opt-in. Requiring the discovered awdl0 interface
+        // makes the peer-to-peer route deterministic; nil retains normal AP-routed Wi-Fi.
+        if let requiredInterface {
+            params.includePeerToPeer = true
+            params.requiredInterface = requiredInterface
+        }
         let conn = NWConnection(to: endpoint, using: params)
         connection = conn
         // A dial to a withdrawn Bonjour service (receiver asleep or app

@@ -328,6 +328,11 @@ final class PhoneReceiver: ObservableObject {
             let params = NWParameters(tls: nil, tcp: tcp)
             params.allowLocalEndpointReuse = true
             params.serviceClass = .interactiveVideo
+            // Advertise/accept the same Bonjour service over Apple's public
+            // peer-to-peer Wi-Fi path as well as the infrastructure WLAN.
+            // Mac-side discovery may then bind the connection to awdl0 for a
+            // direct device-to-device path, with normal Wi-Fi as fallback.
+            params.includePeerToPeer = true
             listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
         } catch {
             setStatus("Listener failed: \(error.localizedDescription)")
@@ -412,6 +417,7 @@ final class PhoneReceiver: ObservableObject {
             lastRttMs = rtt
         case "ping":
             // The Mac piggybacks its send-side health on liveness pings.
+            transport = obj["transport"] as? String ?? transport
             if let enc = obj["encDrops"] as? Int {
                 macEncDrops = enc
             } else if let drops = obj["drops"] as? Int {
