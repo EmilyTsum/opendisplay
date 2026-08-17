@@ -57,3 +57,11 @@ clang -fobjc-arc -framework Foundation sidecar-native-tune.m -o sidecar-native-t
 ```
 
 Do the experiments one variable at a time. A successful completion only means Sidecar accepted the request; it does not prove the receiver actually ran at 120 Hz or used the requested codec.
+
+Build all three research tools at once:
+
+```sh
+./build-tools.sh
+```
+
+The binaries are placed under `build/` by default.

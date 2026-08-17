@@ -14,6 +14,6 @@ jobs:
       - uses: actions/checkout@v6
       - name: Build native Sidecar tuner
         run: |
-          clang -fobjc-arc -framework Foundation tools/os-integration-research/sidecar-native-tune.m -o /tmp/sidecar-native-tune
-          /tmp/sidecar-native-tune list
-          /tmp/sidecar-native-tune --help
+          tools/os-integration-research/build-tools.sh /tmp/sidecar-tools
+          /tmp/sidecar-tools/sidecar-native-tune list
+          /tmp/sidecar-tools/sidecar-native-tune --help
