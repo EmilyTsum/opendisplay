@@ -1,0 +1,41 @@
+name: Bluetooth Link Quality Origin Probe
+on:
+  push:
+    branches: [research/bluetooth-aac-128k]
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Attribute link quality class and inspect bluetoothd
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/bt-link-origin"; mkdir -p "$OUT"
+          cat > /tmp/origin.m <<'SRC'
+          #import <Foundation/Foundation.h>
+          #import <objc/runtime.h>
+          #import <dlfcn.h>
+          int main(){@autoreleasepool{
+            dlopen("/System/Library/PrivateFrameworks/BluetoothAudio.framework/BluetoothAudio",RTLD_NOW);
+            for(NSString *n in @[@"CBAudioLinkQualityInfo",@"CBControllerInfo",@"CBController",@"BluetoothBridge"]){
+              Class c=NSClassFromString(n); printf("%s image=%s\n",n.UTF8String,c?class_getImageName(c):"MISSING");
+            }
+          }return 0;}
+          SRC
+          clang -fobjc-arc -framework Foundation /tmp/origin.m -o /tmp/origin
+          /tmp/origin > "$OUT/class-images.txt"
+          cat "$OUT/class-images.txt"
+          find /usr/sbin /usr/libexec /System/Library -maxdepth 7 -type f -iname 'bluetoothd' 2>/dev/null > "$OUT/bluetoothd-paths.txt" || true
+          while IFS= read -r p; do
+            [ -f "$p" ] || continue
+            file "$p" >> "$OUT/bluetoothd-file.txt" || true
+            strings -a -t x "$p" | grep -iE 'audio.?link.?quality|CBAudioLinkQualityInfo|bit.?rate|codec.?type|retransmit|jitter|noise.?floor|signal.?to.?noise|rssi|A2DP|AAC|LinkAdapt' > "$OUT/bluetoothd-hits.txt" || true
+            otool -ov "$p" > "$OUT/bluetoothd-objc.txt" 2>&1 || true
+            grep -n -B12 -A30 -E 'audioLinkQuality|CBAudioLinkQualityInfo|setBitRate:|setCodecType:' "$OUT/bluetoothd-objc.txt" > "$OUT/bluetoothd-objc-context.txt" || true
+          done < "$OUT/bluetoothd-paths.txt"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: bluetooth-link-origin
+          path: ${{ runner.temp }}/bt-link-origin
