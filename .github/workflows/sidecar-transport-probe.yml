@@ -1,0 +1,26 @@
+name: Sidecar Transport Enum Probe
+on:
+  push:
+    branches: [research/os-integration-private-api]
+    paths: ['.github/workflows/sidecar-transport-probe.yml']
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Inspect SidecarTransport metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BIN=/usr/libexec/SidecarRelay
+          test -f "$BIN"
+          echo '== nm demangled =='
+          nm -a "$BIN" 2>/dev/null | xcrun swift-demangle 2>/dev/null | grep -i -E 'SidecarTransport|transport' | head -500 || true
+          echo '== strings demangled =='
+          strings -a "$BIN" | xcrun swift-demangle 2>/dev/null | grep -i -E 'SidecarTransport|transport' | head -700 || true
+          echo '== swift reflection tools =='
+          for t in swift-inspect swift-reflection-dump swift-demangle; do xcrun -f "$t" 2>/dev/null || true; done
+          T=$(xcrun -f swift-inspect 2>/dev/null || true)
+          if [ -n "$T" ]; then "$T" "$BIN" 2>&1 | grep -i -E 'SidecarTransport|case|transport' | head -1000 || true; fi
