@@ -126,7 +126,7 @@ struct USBLinkInfo: Equatable, Sendable {
     private static func findDeviceNode(in value: Any, locationID wanted: Int) -> [String: Any]? {
         if let dict = value as? [String: Any] {
             for (key, raw) in dict where key.lowercased().contains("location") {
-                if locationID(from: raw) == wanted { return dict }
+                if parseLocationID(from: raw) == wanted { return dict }
             }
             for raw in dict.values {
                 if let found = findDeviceNode(in: raw, locationID: wanted) { return found }
@@ -139,7 +139,7 @@ struct USBLinkInfo: Equatable, Sendable {
         return nil
     }
 
-    private static func locationID(from value: Any) -> Int? {
+    private static func parseLocationID(from value: Any) -> Int? {
         if let value = value as? Int { return value }
         if let number = value as? NSNumber { return number.intValue }
         guard let string = value as? String else { return nil }
@@ -202,7 +202,7 @@ struct USBLinkInfo: Equatable, Sendable {
             return lines.firstIndex(where: {
                 $0.localizedCaseInsensitiveContains(hex)
                     || ($0.localizedCaseInsensitiveContains("location")
-                        && locationID(from: $0) == location)
+                        && parseLocationID(from: $0) == location)
             })
         }
         guard let anchorIndex = serialIndex ?? locationIndex else { return nil }
