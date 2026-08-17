@@ -82,3 +82,8 @@ The binaries are placed under `build/` by default.
 ./build/sidecar-log-monitor
 ./build/sidecar-log-monitor --last 10m
 ```
+
+
+## Real-device sequence
+
+Before any `--apply` test, follow `HOME_TEST_PLAN.md`. It captures the stock config and measured refresh first, then tests 120 Hz, codec, bitrate, and low-latency one variable at a time.
