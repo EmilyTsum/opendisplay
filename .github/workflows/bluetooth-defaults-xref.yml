@@ -1,0 +1,36 @@
+name: Bluetooth Defaults Xref Probe
+on:
+  push:
+    branches: [research/bluetooth-aac-128k]
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v6
+      - name: Trace bluetoothd AAC preference readers
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/bt-defaults-xref"; mkdir -p "$OUT"
+          BIN=/usr/sbin/bluetoothd
+          lipo "$BIN" -thin x86_64 -output "$OUT/bluetoothd.x86_64" || cp "$BIN" "$OUT/bluetoothd.x86_64"
+          strings -a -t x "$OUT/bluetoothd.x86_64" | grep -E 'AACBitrate$|AACELDBitrate$|DisableAAC$|DisableAACELD$|LinkAdaptiveBitrateAAC$|DisableAdaptiveEncoderBitrate$|configs$|thresholds$|rates$|bitrateCount$|com.apple.bluetoothd|BluetoothAudioAgent' > "$OUT/key-offsets.txt" || true
+          otool -v -s __TEXT __cstring "$OUT/bluetoothd.x86_64" > "$OUT/cstrings.txt" 2>&1 || true
+          otool -tvV "$OUT/bluetoothd.x86_64" > "$OUT/disasm.txt" 2>&1 || true
+          nm -u "$OUT/bluetoothd.x86_64" | grep -E 'CFPreferences|NSUserDefaults|objc_msgSend' > "$OUT/prefs-symbols.txt" || true
+          python3 - <<'PY' "$OUT"
+          import re,sys,subprocess
+          from pathlib import Path
+          out=Path(sys.argv[1]); dis=(out/'disasm.txt').read_text(errors='ignore').splitlines()
+          targets=['AACBitrate','AACELDBitrate','DisableAAC','DisableAACELD','LinkAdaptiveBitrateAAC','DisableAdaptiveEncoderBitrate','configs','thresholds','rates','bitrateCount']
+          hits=[]
+          for i,l in enumerate(dis):
+              if any(('literal pool for: "'+t+'"') in l for t in targets):
+                  hits.extend(dis[max(0,i-70):min(len(dis),i+130)]); hits.append('\n=====NEXT=====\n')
+          (out/'xref-context.txt').write_text('\n'.join(hits))
+          PY
+      - uses: actions/upload-artifact@v6
+        with:
+          name: bluetooth-defaults-xref
+          path: ${{ runner.temp }}/bt-defaults-xref
