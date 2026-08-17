@@ -9,6 +9,28 @@ static long callLong0(id o, const char *s) { return ((long(*)(id,SEL))objc_msgSe
 static void setObj(id o, const char *s, id v) { ((void(*)(id,SEL,id))objc_msgSend)(o, sel_registerName(s), v); }
 static NSString *desc(id v) { return v ? [v description] : @"<nil>"; }
 
+static BOOL requireSelector(id obj, const char *name) {
+    SEL sel=sel_registerName(name);
+    if (![obj respondsToSelector:sel]) {
+        fprintf(stderr,"error: required private selector missing: %s on %s\n",name,object_getClassName(obj));
+        return NO;
+    }
+    return YES;
+}
+
+static void *openSidecarCore(void) {
+    const char *paths[]={
+        "/System/Library/PrivateFrameworks/SidecarCore.framework/SidecarCore",
+        "/System/Library/PrivateFrameworks/SidecarCore.framework/Versions/A/SidecarCore",
+        NULL
+    };
+    for (int i=0; paths[i]; i++) {
+        void *h=dlopen(paths[i],RTLD_LAZY|RTLD_LOCAL);
+        if (h) return h;
+    }
+    return NULL;
+}
+
 static void usage(void) {
     puts("sidecar-native-tune — research-only native Sidecar config probe/tuner");
     puts("");
@@ -139,12 +161,16 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     NSArray<NSString*> *args=[[NSProcessInfo processInfo] arguments];
     if (argc<2 || hasArg(args,@"--help") || hasArg(args,@"-h")) { usage(); return argc<2?2:0; }
 
-    void *h=dlopen("/System/Library/PrivateFrameworks/SidecarCore.framework/SidecarCore",RTLD_LAZY|RTLD_LOCAL);
-    if (!h) { fprintf(stderr,"error: SidecarCore: %s\n",dlerror()); return 1; }
+    printf("host=%s\n",[[NSProcessInfo processInfo].operatingSystemVersionString UTF8String]);
+    void *h=openSidecarCore();
+    if (!h) { fprintf(stderr,"error: SidecarCore could not be loaded: %s\n",dlerror()); return 1; }
     Class mc=NSClassFromString(@"SidecarDisplayManager");
     if (!mc) { fprintf(stderr,"error: SidecarDisplayManager unavailable on this macOS build\n"); return 1; }
     id mgr=call0((id)mc,"sharedManager");
     if (!mgr) { fprintf(stderr,"error: SidecarDisplayManager.sharedManager unavailable\n"); return 1; }
+    if (!requireSelector(mgr,"devices") || !requireSelector(mgr,"connectedDevices") ||
+        !requireSelector(mgr,"configForDevice:") || !requireSelector(mgr,"connectToDevice:withConfig:completion:") ||
+        !requireSelector(mgr,"disconnectFromDevice:completion:")) return 1;
 
     NSString *cmd=args[1];
     if ([cmd isEqualToString:@"list"]) {
@@ -193,20 +219,23 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     @try { stock=call1(mgr,"configForDevice:",dev); }
     @catch(NSException *e) { fprintf(stderr,"error: configForDevice exception: %s\n",e.reason.UTF8String); return 4; }
     if (!stock) { fprintf(stderr,"error: stock Sidecar config is nil; refusing to construct a full config from guesses\n"); return 8; }
+    if (!requireSelector(stock,"copyWithZone:")) return 8;
     id cfg=call0(stock,"copy");
     if (!cfg) { fprintf(stderr,"error: SidecarDisplayConfig copy failed\n"); return 8; }
 
-    NSNumber *fps=parseIntOpt(args,@"--fps",1,240); if (fps) setObj(cfg,"setFramerate:",fps);
+    NSNumber *fps=parseIntOpt(args,@"--fps",1,240);
+    if (fps) { if(!requireSelector(cfg,"setFramerate:")) return 8; setObj(cfg,"setFramerate:",fps); }
     NSString *codec=argValue(args,@"--codec");
     if (codec && ![codec isEqualToString:@"stock"]) {
+        if(!requireSelector(cfg,"setCodec:")) return 8;
         if ([codec caseInsensitiveCompare:@"h264"]==NSOrderedSame || [codec caseInsensitiveCompare:@"h.264"]==NSOrderedSame) setObj(cfg,"setCodec:",@0);
         else if ([codec caseInsensitiveCompare:@"hevc"]==NSOrderedSame || [codec caseInsensitiveCompare:@"h265"]==NSOrderedSame || [codec caseInsensitiveCompare:@"h.265"]==NSOrderedSame) setObj(cfg,"setCodec:",@1);
         else { fprintf(stderr,"error: --codec must be stock, h264, or hevc\n"); return 2; }
     }
-    NSNumber *maxb=parseMbps(args,@"--max-mbps"); if (maxb) setObj(cfg,"setTxMaxBitrate:",maxb);
-    NSNumber *minb=parseMbps(args,@"--min-mbps"); if (minb) setObj(cfg,"setTxMinBitrate:",minb);
-    NSNumber *ll=parseIntOpt(args,@"--low-latency",0,1); if (ll) setObj(cfg,"setLowLatency:",@([ll boolValue]));
-    NSNumber *ts=parseIntOpt(args,@"--time-sync",0,1); if (ts) setObj(cfg,"setEnableTimeSync:",@([ts boolValue]));
+    NSNumber *maxb=parseMbps(args,@"--max-mbps"); if (maxb) { if(!requireSelector(cfg,"setTxMaxBitrate:")) return 8; setObj(cfg,"setTxMaxBitrate:",maxb); }
+    NSNumber *minb=parseMbps(args,@"--min-mbps"); if (minb) { if(!requireSelector(cfg,"setTxMinBitrate:")) return 8; setObj(cfg,"setTxMinBitrate:",minb); }
+    NSNumber *ll=parseIntOpt(args,@"--low-latency",0,1); if (ll) { if(!requireSelector(cfg,"setLowLatency:")) return 8; setObj(cfg,"setLowLatency:",@([ll boolValue])); }
+    NSNumber *ts=parseIntOpt(args,@"--time-sync",0,1); if (ts) { if(!requireSelector(cfg,"setEnableTimeSync:")) return 8; setObj(cfg,"setEnableTimeSync:",@([ts boolValue])); }
 
     puts("=== stock config ==="); printConfig(stock,"  ");
     puts("=== requested config ==="); printConfig(cfg,"  ");
