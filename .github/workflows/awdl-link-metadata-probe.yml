@@ -1,0 +1,41 @@
+name: AWDL Link Metadata Probe
+on:
+  push:
+    branches: [research/os-integration-private-api]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+      - name: Inspect public and private AWDL diagnostics
+        shell: bash
+        run: |
+          set +e
+          echo '== interfaces =='
+          ifconfig awdl0
+          netstat -I awdl0 -b -d
+          echo '== wdutil help/info =='
+          wdutil 2>&1 | head -100
+          sudo wdutil info 2>&1 | head -500
+          echo '== framework inventory =='
+          find /System/Library/PrivateFrameworks -maxdepth 2 \( -iname '*wifi*' -o -iname '*80211*' -o -iname '*peer*' \) -print | sort | head -300
+          echo '== daemon inventory =='
+          find /usr/libexec /System/Library/CoreServices -maxdepth 2 -type f \( -iname '*wifi*' -o -iname '*awdl*' -o -iname '*80211*' \) -print 2>/dev/null | sort | head -200
+          echo '== likely binary strings =='
+          for f in \
+            /usr/libexec/airportd \
+            /usr/libexec/wifip2pd \
+            /System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Apple80211 \
+            /System/Library/PrivateFrameworks/WiFiPeerToPeer.framework/Versions/Current/WiFiPeerToPeer \
+            /System/Library/Frameworks/CoreWLAN.framework/Versions/Current/CoreWLAN; do
+            if [ -f "$f" ]; then
+              echo "--- $f"
+              strings -a "$f" | grep -Ei 'awdl|channel|bandwidth|width|frequency|freq|phy|rate|mcs|rssi|peer.*info|link.*speed' | head -1000
+            fi
+          done
+          echo '== ioreg wifi keys =='
+          ioreg -l -w0 | grep -Ei 'awdl|channel|bandwidth|frequency|phy.*rate|link.*rate|mcs|rssi' | head -1000
+          echo '== system profiler wifi =='
+          system_profiler SPAirPortDataType -detailLevel full | head -1000
