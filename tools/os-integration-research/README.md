@@ -65,3 +65,20 @@ Build all three research tools at once:
 ```
 
 The binaries are placed under `build/` by default.
+
+
+## Display refresh verification
+
+`display-refresh-probe.m` reports the current Quartz mode and can measure CVDisplayLink callback cadence for a selected display. This is used after a native Sidecar tuning experiment so `framerate=120` is not treated as proof by itself.
+
+```sh
+./build/display-refresh-probe list
+./build/display-refresh-probe measure DISPLAY_ID 5
+```
+
+`sidecar-log-monitor.sh` captures SidecarDisplayAgent/SidecarRelay messages relevant to codec, bitrate, transport and display configuration:
+
+```sh
+./build/sidecar-log-monitor
+./build/sidecar-log-monitor --last 10m
+```
