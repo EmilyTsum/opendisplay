@@ -404,8 +404,14 @@ struct PerfOverlay: View {
                 }
                 metric("rtt", String(format: "%.0f ms", stats.rttMs))
                 metric("Rx FPS", "\(stats.fps)")
-                if stats.transport == "USB", !stats.usbLink.isEmpty {
-                    metric("USB link", stats.usbLink)
+                if stats.transport == "USB" {
+                    metric("USB link", stats.usbLink.isEmpty ? "Detecting…" : stats.usbLink)
+                }
+                if !stats.audioFormat.isEmpty {
+                    metric("audio", stats.audioFormat)
+                    if stats.audioDrops > 0 {
+                        metric("audio↓", "\(stats.audioDrops)")
+                    }
                 }
                 if panelFPS > 0 {
                     metric("panel Hz", "\(panelFPS)")

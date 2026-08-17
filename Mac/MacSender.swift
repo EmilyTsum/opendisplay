@@ -17,6 +17,7 @@ import ScreenCaptureKit
 import VideoToolbox
 import Network
 import CoreMedia
+import AVFoundation
 import AppKit
 
 enum CaptureMode: String {
@@ -133,6 +134,7 @@ struct PhoneInfo: Decodable {
     let name: String?     // user-configured OpenDisplay device name
     let maxFPS: Int?      // panel maximum refresh rate (60 / 120 today)
     let codecs: [String]? // receiver-supported codecs, preferred first
+    let audioFormats: [String]? // optional additive audio capabilities
     let id: String?       // per-install identity (older receivers omit it) —
                           // lets the controller match the same physical device
                           // across USB and WiFi
@@ -153,6 +155,10 @@ struct PhoneInfo: Decodable {
     var supportsProResProxy: Bool {
         protocolVersion >= WireProtocol.mediaCapabilitiesVersion
             && (codecs?.contains(StreamCodec.proResProxy.rawValue) ?? false)
+    }
+    var supportsPCM48kStereo: Bool {
+        protocolVersion >= WireProtocol.pcmAudioVersion
+            && (audioFormats?.contains(StreamAudioFormat.pcmS16LE48kStereo.rawValue) ?? false)
     }
 }
 
@@ -212,6 +218,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private let quality: StreamQuality
     private let codecPreference: CodecPreference
     private let refreshRatePreference: RefreshRatePreference
+    private let audioEnabled: Bool
+    private var activeAudio = false
     private var activeCodec: StreamCodec = .h264
     private var activeFrameRate = 60
     // Physical USB enumeration speed, independent from the throughput we
@@ -219,6 +227,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // ready and surfaced to the receiver HUD for cable/link diagnosis.
     private var usbLinkInfo: USBLinkInfo?
     private var usbLinkProbeGeneration = 0
+    private var usbLinkProbeComplete = false
     private var connectedUSBUDID: String?
     // Stable per-device serial for the virtual display, so macOS can tell
     // multiple OpenDisplay monitors apart and persist their arrangement.
@@ -276,6 +285,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var pendingProResFrame: ProResWirePacket?
     private var proResSendDurationsThisWindow: [Double] = []
     private var proResFrameBytesThisWindow: [Int] = []
+    private let audioQueue = DispatchQueue(label: "sender.audio", qos: .userInteractive)
+    private var audioPacketsSent = 0
+    private var audioBytesSent = 0
     private let pipelineLock = NSLock()
     private var dropsEncThisWindow = 0
     private var dropsNetThisWindow = 0
@@ -386,6 +398,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
          quality: StreamQuality = .best,
          codecPreference: CodecPreference = .auto,
          refreshRatePreference: RefreshRatePreference = .auto,
+         audioEnabled: Bool = true,
          displaySerial: UInt32 = 0x0001,
          awaitingWake: Bool = false) {
         self.transport = transport
@@ -394,6 +407,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         self.quality = quality
         self.codecPreference = codecPreference
         self.refreshRatePreference = refreshRatePreference
+        self.audioEnabled = audioEnabled
         self.displaySerial = displaySerial
         self.awaitingWake = awaitingWake
         super.init()
@@ -478,6 +492,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             peerSupportsHEVC: info.supportsHEVC,
             peerSupportsProResLT: info.supportsProResLT,
             peerSupportsProResProxy: info.supportsProResProxy)
+        activeAudio = audioEnabled && info.supportsPCM48kStereo
         // USB session IDs are based on the hardware UDID while WiFi IDs are
         // based on Bonjour names. Deriving the display serial from either made
         // the *same iPad* become two different virtual monitors depending on
@@ -486,7 +501,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         if let installID = info.id {
             displaySerial = DisplayIdentity.serial(for: installID)
         }
-        Log.info("phone hello: \(info.pixelsWide)x\(info.pixelsHigh) @\(info.scale)x maxFPS=\(info.maximumFrameRate) codec=\(activeCodec.displayName) target=\(activeFrameRate)Hz")
+        Log.info("phone hello: \(info.pixelsWide)x\(info.pixelsHigh) @\(info.scale)x maxFPS=\(info.maximumFrameRate) codec=\(activeCodec.displayName) target=\(activeFrameRate)Hz audio=\(activeAudio ? "PCM48k2" : "off")")
 
         // Phone panel is @3x; the virtual display runs @2x HiDPI, so points
         // = native pixels / 2 (rounded down to even for the encoder).
@@ -721,6 +736,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // the encoder for ~13ms — headroom prevents SCK starvation drops.
         config.queueDepth = 8
         config.showsCursor = !localCursor
+        if activeAudio {
+            config.capturesAudio = true
+            config.sampleRate = 48_000
+            config.channelCount = 2
+            config.excludesCurrentProcessAudio = true
+        }
 
         invalidateCapturePipeline(discardingLastFrame: true)
         let generation = captureGenerationNow
@@ -728,6 +749,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+        if activeAudio {
+            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+        }
         self.stream = stream
         do {
             try await stream.startCapture()
@@ -954,9 +978,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func refreshUSBLinkInfo() {
         usbLinkProbeGeneration += 1
         let probeGeneration = usbLinkProbeGeneration
+        usbLinkProbeComplete = false
         guard case .usb = transport,
               let udid = connectedUSBUDID, !udid.isEmpty else {
             usbLinkInfo = nil
+            usbLinkProbeComplete = true
             return
         }
         Task { [weak self] in
@@ -967,6 +993,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                       case .usb = self.transport,
                       self.connectedUSBUDID == udid else { return }
                 self.usbLinkInfo = info
+                self.usbLinkProbeComplete = true
                 if let info {
                     Log.info("physical USB link: \(info.hudLabel) (device \(udid.prefix(8))…)")
                 } else {
@@ -979,6 +1006,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func connectTCP(_ endpoint: NWEndpoint) {
         connectedUSBUDID = nil
         usbLinkInfo = nil
+        usbLinkProbeComplete = false
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
         let params = NWParameters(tls: nil, tcp: options)
@@ -1162,7 +1190,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 let inp50 = sorted.isEmpty ? 0 : sorted[sorted.count / 2].rounded()
                 let inp95 = sorted.isEmpty ? 0 : sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.95))].rounded()
                 let usbMbps = self.usbLinkInfo?.megabitsPerSecond ?? 0
-                let usbLink = self.usbLinkInfo?.hudLabel ?? ""
+                let usbLink: String
+                if case .usb = self.transport {
+                    usbLink = self.usbLinkInfo?.hudLabel
+                        ?? (self.usbLinkProbeComplete ? "Unavailable" : "Detecting…")
+                } else {
+                    usbLink = ""
+                }
                 self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps),\"encFps\":\(encFps),\"encMs50\":\(enc50),\"encMs95\":\(enc95),\"encInFlight\":\(encodeInflightNow),\"encPeak\":\(encodeInflightPeak),\"encLimit\":\(self.maxPendingEncodes),\"wireMs50\":\(wire50),\"wireMs95\":\(wire95),\"frameKB\":\(frameKB),\"usbMbps\":\(usbMbps),\"usbLink\":\"\(usbLink)\"}")
             }
             self.schedulePing()
@@ -1560,8 +1594,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
         guard stream === self.stream,
-              type == .screen,
-              CMSampleBufferIsValid(sampleBuffer),
+              CMSampleBufferIsValid(sampleBuffer) else { return }
+
+        if type == .audio {
+            handleAudioSample(sampleBuffer)
+            return
+        }
+
+        guard type == .screen,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
 
@@ -1581,6 +1621,75 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         if !activeCodec.isProRes, shouldDropFrame(reason: "pending_sends") { return }
 
         encode(pixelBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), generation: generation)
+    }
+
+    /// ScreenCaptureKit is configured to deliver 48 kHz stereo. It exposes
+    /// audio as Float32 PCM buffers; convert to compact signed 16-bit
+    /// interleaved PCM before putting it on the wire. At 48k/2ch this is only
+    /// 1.536 Mbit/s, so keeping it lossless is cheap even beside ProRes video.
+    private func handleAudioSample(_ sampleBuffer: CMSampleBuffer) {
+        guard activeAudio, connectionReady else { return }
+        do {
+            try sampleBuffer.withAudioBufferList { audioBufferList, _ in
+                guard let description = sampleBuffer.formatDescription?.audioStreamBasicDescription,
+                      description.mSampleRate == 48_000,
+                      description.mChannelsPerFrame > 0,
+                      let format = AVAudioFormat(
+                        standardFormatWithSampleRate: description.mSampleRate,
+                        channels: description.mChannelsPerFrame),
+                      let pcm = AVAudioPCMBuffer(pcmFormat: format,
+                                                 bufferListNoCopy: audioBufferList.unsafePointer),
+                      let channels = pcm.floatChannelData else { return }
+
+                let frameCount = Int(pcm.frameLength)
+                guard frameCount > 0 else { return }
+                let sourceChannels = Int(pcm.format.channelCount)
+                var samples = Data(count: frameCount * 2 * MemoryLayout<Int16>.size)
+                samples.withUnsafeMutableBytes { raw in
+                    let out = raw.bindMemory(to: Int16.self)
+                    for frame in 0..<frameCount {
+                        let l = max(-1.0, min(1.0, channels[0][frame]))
+                        let rSource = sourceChannels > 1 ? channels[1][frame] : channels[0][frame]
+                        let r = max(-1.0, min(1.0, rSource))
+                        out[frame * 2] = Int16((l * Float(Int16.max)).rounded()).littleEndian
+                        out[frame * 2 + 1] = Int16((r * Float(Int16.max)).rounded()).littleEndian
+                    }
+                }
+                sendAudioPCM(samples)
+            }
+        } catch {
+            Log.info("audio sample conversion failed: \(error)")
+        }
+    }
+
+    /// Wire payload: [ODAU][u32 sampleRate][u16 channels][u16 bits][PCM...].
+    /// The normal outer OpenDisplay u32 frame length still wraps this packet.
+    private func sendAudioPCM(_ pcm: Data) {
+        var payload = Data("ODAU".utf8)
+        var sampleRate = UInt32(48_000).bigEndian
+        var channels = UInt16(2).bigEndian
+        var bits = UInt16(16).bigEndian
+        payload.append(Data(bytes: &sampleRate, count: 4))
+        payload.append(Data(bytes: &channels, count: 2))
+        payload.append(Data(bytes: &bits, count: 2))
+        payload.append(pcm)
+
+        queue.async { [weak self] in
+            guard let self, self.activeAudio, self.connectionReady,
+                  let connection = self.connection else { return }
+            var length = UInt32(payload.count).bigEndian
+            var frame = Data(bytes: &length, count: 4)
+            frame.append(payload)
+            connection.send(content: frame, completion: .contentProcessed { [weak self] error in
+                guard let self else { return }
+                if let error {
+                    Log.info("audio send error: \(error)")
+                } else {
+                    self.audioPacketsSent += 1
+                    self.audioBytesSent += frame.count
+                }
+            })
+        }
     }
 
     private func isPipelineBackedUp() -> Bool {

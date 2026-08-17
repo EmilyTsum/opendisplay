@@ -192,6 +192,9 @@ final class SenderController: ObservableObject {
     @Published var refreshRatePreference = RefreshRatePreference(rawValue: UserDefaults.standard.string(forKey: "refreshRatePreference") ?? "") ?? .auto {
         didSet { UserDefaults.standard.set(refreshRatePreference.rawValue, forKey: "refreshRatePreference") }
     }
+    @Published var audioEnabled = UserDefaults.standard.object(forKey: "audioEnabled") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(audioEnabled, forKey: "audioEnabled") }
+    }
 
     var running: Bool { !sessions.isEmpty }
 
@@ -522,6 +525,7 @@ final class SenderController: ObservableObject {
                                quality: quality,
                                codecPreference: codecPreference,
                                refreshRatePreference: refreshRatePreference,
+                               audioEnabled: audioEnabled,
                                displaySerial: Self.displaySerial(for: id),
                                awaitingWake: awaitingWake)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
@@ -863,6 +867,9 @@ struct ContentView: View {
                     }
                 }
                 .onChange(of: controller.refreshRatePreference) { controller.restartAll() }
+
+                Toggle("Stream audio (PCM 48 kHz stereo)", isOn: $controller.audioEnabled)
+                    .onChange(of: controller.audioEnabled) { controller.restartAll() }
 
                 VStack(alignment: .leading, spacing: 4) {
                     Picker("Show app in", selection: $controller.presentation) {

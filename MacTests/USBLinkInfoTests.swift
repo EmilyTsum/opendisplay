@@ -36,4 +36,19 @@ final class USBLinkInfoTests: XCTestCase {
         XCTAssertEqual(USBLinkInfo.parseSpeedString("480 Mb/s"), 480)
         XCTAssertEqual(USBLinkInfo.parseSpeedString("12 Mbit/s"), 12)
     }
+
+    func testParsesHumanReadableProfilerFallback() {
+        let text = """
+            USB 3.1 Bus:
+
+              iPad:
+                Product ID: 0x12ab
+                Speed: Up to 5 Gb/s
+                Serial Number: 00008110-001234567890001E
+        """
+        let info = USBLinkInfo.parseText(profile: text,
+                                         udid: "00008110-001234567890001E")
+        XCTAssertEqual(info?.megabitsPerSecond, 5_000)
+        XCTAssertEqual(info?.hudLabel, "USB · 5 Gb/s")
+    }
 }

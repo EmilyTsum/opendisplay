@@ -11,7 +11,7 @@ import Foundation
 /// protocol 1 — that's every install in the field that predates the handshake.
 enum WireProtocol {
     /// The protocol version this build speaks.
-    static let version = 4
+    static let version = 5
 
     /// Protocol version that introduced Apple Pencil / proximity wire messages.
     /// Peers below this get pencil input as legacy `touch` events.
@@ -22,6 +22,9 @@ enum WireProtocol {
     /// its user-configured display name in `hello`.
     static let mediaCapabilitiesVersion = 4
 
+    /// Protocol version that introduced low-latency stereo PCM audio packets.
+    static let pcmAudioVersion = 5
+
     /// Oldest peer protocol version this build still supports. Stays at 1
     /// (support everything) until a deliberate two-phase breaking change
     /// raises it — raising this is what turns "peer too old" into a hard gate.
@@ -29,6 +32,11 @@ enum WireProtocol {
 
     /// A peer that advertises no `pv` is defined as protocol 1.
     static let assumedWhenAbsent = 1
+}
+
+enum StreamAudioFormat: String, Codable, CaseIterable {
+    /// Signed 16-bit little-endian, interleaved stereo, 48 kHz.
+    case pcmS16LE48kStereo = "pcmS16LE48k2"
 }
 
 /// Control-message `type` strings introduced with the handshake. The pre-

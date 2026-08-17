@@ -39,6 +39,15 @@ struct USBLinkInfo: Equatable, Sendable {
     }
 
     static func detectSynchronously(udid: String) -> USBLinkInfo? {
+        // Prefer JSON because it is locale-independent. Some macOS releases,
+        // however, omit the device speed from SPUSBDataType's JSON while the
+        // human-readable report still contains `Speed: Up to …`. Fall back to
+        // that report before giving up so the HUD never depends on one schema.
+        if let info = detectJSON(udid: udid) { return info }
+        return detectText(udid: udid)
+    }
+
+    private static func detectJSON(udid: String) -> USBLinkInfo? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
         process.arguments = ["SPUSBDataType", "-json", "-detailLevel", "full"]
@@ -55,6 +64,21 @@ struct USBLinkInfo: Equatable, Sendable {
         guard process.terminationStatus == 0,
               let root = try? JSONSerialization.jsonObject(with: data) else { return nil }
         return parse(profile: root, udid: udid)
+    }
+
+    private static func detectText(udid: String) -> USBLinkInfo? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
+        process.arguments = ["SPUSBDataType", "-detailLevel", "full"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0,
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        return parseText(profile: text, udid: udid)
     }
 
     /// Exposed to the hostless Mac test target so schema/key variations can be
@@ -133,6 +157,28 @@ struct USBLinkInfo: Equatable, Sendable {
         default: return nil
         }
         return Int((number * multiplier).rounded())
+    }
+
+    static func parseText(profile: String, udid: String) -> USBLinkInfo? {
+        let wanted = normalizeIdentifier(udid)
+        guard !wanted.isEmpty else { return nil }
+        let lines = profile.components(separatedBy: .newlines)
+        guard let serialIndex = lines.firstIndex(where: {
+            normalizeIdentifier($0).contains(wanted)
+        }) else { return nil }
+
+        // Speed and serial are sibling properties in system_profiler's device
+        // block. Search a small symmetric window because their order differs
+        // across macOS versions and device classes. Choose the nearest speed.
+        let lower = max(0, serialIndex - 20)
+        let upper = min(lines.count - 1, serialIndex + 20)
+        let candidates = (lower...upper).compactMap { index -> (Int, Int)? in
+            guard lines[index].localizedCaseInsensitiveContains("speed"),
+                  let mbps = parseSpeedString(lines[index]) else { return nil }
+            return (abs(index - serialIndex), mbps)
+        }
+        guard let nearest = candidates.min(by: { $0.0 < $1.0 }) else { return nil }
+        return USBLinkInfo(megabitsPerSecond: nearest.1)
     }
 
     private static func normalizeIdentifier(_ value: String) -> String {

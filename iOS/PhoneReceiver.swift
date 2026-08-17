@@ -45,6 +45,8 @@ struct PerfStats: Equatable {
     var encPeak = 0              // peak VT in-flight count in the last Mac window
     var encLimit = 0             // active sender backpressure limit (1 at 60, 2 at 120)
     var usbLink = ""             // physical USB enumeration speed from macOS
+    var audioFormat = ""         // active low-latency audio wire/playback format
+    var audioDrops = 0            // packets discarded to avoid audio queue latency
     var usbMbps = 0              // 480 / 5000 / 10000 / ...; 0 when unknown/WiFi
     var wireSendP50 = 0.0        // ProRes Network.framework completion latency
     var wireSendP95 = 0.0
@@ -126,6 +128,17 @@ final class PhoneReceiver: ObservableObject {
     private var macWireSendP95 = 0.0
     private var macWireFrameKB = 0.0
 
+    // Low-latency system-audio playback. Video and audio share the outer TCP
+    // framing, but audio has its own AVAudioEngine queue and never contributes
+    // to the video backpressure counters.
+    private let audioEngine = AVAudioEngine()
+    private let audioPlayer = AVAudioPlayerNode()
+    private var audioPlaybackFormat: AVAudioFormat?
+    private var audioConfigured = false
+    private var audioQueuedBuffers = 0
+    private var audioDrops = 0
+    private var audioFormatLabel = ""
+
     private var nowMs: Double { Date().timeIntervalSince1970 * 1000 }
 
     // Local cursor echo (both called on the main thread): position is
@@ -195,10 +208,17 @@ final class PhoneReceiver: ObservableObject {
 
     private var supportedCodecNames: [String] {
         var codecs: [String] = []
-        if VTIsHardwareDecodeSupported(kCMVideoCodecType_AppleProRes422Proxy) {
+        // VideoToolbox's per-FourCC hardware capability query is inconsistent
+        // for ProRes variants on some iPadOS builds: the same ProRes media
+        // engine that successfully decodes 422 LT can report `false` for Proxy.
+        // Treat LT/Proxy as one decoder family for negotiation. We still build
+        // the exact Proxy format description when that codec is selected, so a
+        // genuine decode failure remains visible instead of silently changing
+        // the bitstream type.
+        let proResHardware = VTIsHardwareDecodeSupported(kCMVideoCodecType_AppleProRes422LT)
+            || VTIsHardwareDecodeSupported(kCMVideoCodecType_AppleProRes422Proxy)
+        if proResHardware {
             codecs.append(StreamCodec.proResProxy.rawValue)
-        }
-        if VTIsHardwareDecodeSupported(kCMVideoCodecType_AppleProRes422LT) {
             codecs.append(StreamCodec.proResLT.rawValue)
         }
         if VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC) {
@@ -540,6 +560,9 @@ final class PhoneReceiver: ObservableObject {
         }
         decodeWindow.removeAll(keepingCapacity: true)
         photonWindow.removeAll(keepingCapacity: true)
+        audioPlayer.stop()
+        audioQueuedBuffers = 0
+        audioFormatLabel = ""
     }
 
     // MARK: - Control messages (phone -> Mac)
@@ -554,6 +577,7 @@ final class PhoneReceiver: ObservableObject {
             "name": serviceName,
             "maxFPS": UIScreen.main.maximumFramesPerSecond,
             "codecs": supportedCodecNames,
+            "audioFormats": [StreamAudioFormat.pcmS16LE48kStereo.rawValue],
             "id": Self.installID,
             "pv": WireProtocol.version,   // issue #132 — absent on old receivers
         ], on: conn)
@@ -690,6 +714,11 @@ final class PhoneReceiver: ObservableObject {
             return
         }
 
+        if data.count >= 12, data.prefix(4) == Data("ODAU".utf8) {
+            handleAudioFrame(data)
+            return
+        }
+
         // Protocol-additive ProRes sample framing. H.264/HEVC continue through
         // the legacy Annex-B parser below unchanged.
         if data.count >= 8, data.prefix(4) == Data("ODPR".utf8) {
@@ -786,6 +815,82 @@ final class PhoneReceiver: ObservableObject {
         }
         guard !vclNALUs.isEmpty else { return }
         enqueueFrame(vclNALUs, captureMs: captureMs, sendMs: sendMs)
+    }
+
+    /// [ODAU][u32 sampleRate][u16 channels][u16 bits][S16LE interleaved PCM]
+    private func handleAudioFrame(_ data: Data) {
+        let sampleRate = data[4..<8].withUnsafeBytes {
+            Int(UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self)))
+        }
+        let channels = data[8..<10].withUnsafeBytes {
+            Int(UInt16(bigEndian: $0.loadUnaligned(as: UInt16.self)))
+        }
+        let bits = data[10..<12].withUnsafeBytes {
+            Int(UInt16(bigEndian: $0.loadUnaligned(as: UInt16.self)))
+        }
+        guard sampleRate == 48_000, channels == 2, bits == 16 else { return }
+        let pcm = data.dropFirst(12)
+        guard !pcm.isEmpty, pcm.count % 4 == 0 else { return }
+
+        // Do not let a transient transport stall turn into seconds of audible
+        // lag. Eight normal SCK audio buffers are already ample jitter room.
+        guard audioQueuedBuffers < 8 else {
+            audioDrops += 1
+            return
+        }
+        guard let format = ensureAudioPlayback(sampleRate: Double(sampleRate),
+                                               channels: AVAudioChannelCount(channels)) else { return }
+        let frames = AVAudioFrameCount(pcm.count / 4)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return }
+        buffer.frameLength = frames
+        let audioBuffers = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        guard let destination = audioBuffers.first?.mData else { return }
+        pcm.withUnsafeBytes { raw in
+            if let source = raw.baseAddress {
+                memcpy(destination, source, pcm.count)
+            }
+        }
+
+        audioQueuedBuffers += 1
+        audioFormatLabel = "PCM 48k/2ch"
+        audioPlayer.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+            self?.queue.async {
+                self?.audioQueuedBuffers = max(0, (self?.audioQueuedBuffers ?? 1) - 1)
+            }
+        }
+        if !audioPlayer.isPlaying { audioPlayer.play() }
+    }
+
+    private func ensureAudioPlayback(sampleRate: Double,
+                                     channels: AVAudioChannelCount) -> AVAudioFormat? {
+        if !audioConfigured {
+            guard let format = AVAudioFormat(commonFormat: .pcmFormatInt16,
+                                             sampleRate: sampleRate,
+                                             channels: channels,
+                                             interleaved: true) else { return nil }
+            do {
+                let session = AVAudioSession.sharedInstance()
+                try session.setCategory(.playback, mode: .default)
+                try session.setPreferredSampleRate(sampleRate)
+                try? session.setPreferredIOBufferDuration(0.005)
+                try session.setActive(true)
+                audioEngine.attach(audioPlayer)
+                audioEngine.connect(audioPlayer, to: audioEngine.mainMixerNode, format: format)
+                try audioEngine.start()
+                audioPlaybackFormat = format
+                audioConfigured = true
+                Log.info("audio playback ready: PCM S16LE 48kHz stereo")
+            } catch {
+                Log.info("audio playback setup failed: \(error)")
+                return nil
+            }
+        } else if !audioEngine.isRunning {
+            do { try audioEngine.start() } catch {
+                Log.info("audio engine restart failed: \(error)")
+                return nil
+            }
+        }
+        return audioPlaybackFormat
     }
 
     /// Receives one complete ProRes compressed sample. ProRes is intra-frame
@@ -1069,6 +1174,8 @@ final class PhoneReceiver: ObservableObject {
             stats.encLimit = macEncLimit
             stats.usbLink = macUSBLink
             stats.usbMbps = macUSBMbps
+            stats.audioFormat = audioFormatLabel
+            stats.audioDrops = audioDrops
             stats.wireSendP50 = macWireSendP50
             stats.wireSendP95 = macWireSendP95
             stats.wireFrameKB = macWireFrameKB
