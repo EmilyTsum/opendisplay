@@ -333,6 +333,12 @@ jobs:
           SRC
           clang -fobjc-arc -framework Foundation "$RUNNER_TEMP/sidecar_connect_config.m" -o "$RUNNER_TEMP/sidecar_connect_config"
           "$RUNNER_TEMP/sidecar_connect_config" > "$OUT/sidecar-connect-config.txt" 2>&1 || true
+      - name: Build read-only Sidecar config dump
+        shell: bash
+        run: |
+          clang -fobjc-arc -framework Foundation \
+            tools/os-integration-research/sidecar-config-dump.m \
+            -o "$RUNNER_TEMP/sidecar-config-dump"
       - uses: actions/upload-artifact@v4
         with:
           name: os-integration-probe
