@@ -4,6 +4,11 @@ on:
     branches: [research/os-integration-private-api]
     paths:
       - 'tools/os-integration-research/sidecar-native-tune.m'
+      - 'tools/os-integration-research/sidecar-intent-probe.m'
+      - 'tools/os-integration-research/sidecar-config-dump.m'
+      - 'tools/os-integration-research/display-refresh-probe.m'
+      - 'tools/os-integration-research/sidecar-log-monitor.sh'
+      - 'tools/os-integration-research/build-tools.sh'
       - '.github/workflows/sidecar-native-tune-build.yml'
   workflow_dispatch:
 jobs:
