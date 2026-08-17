@@ -1,6 +1,7 @@
 name: Bluetooth Debug Write Test
 on:
-  workflow_dispatch:
+  push:
+    branches: [research/bluetooth-aac-128k]
 jobs:
   probe:
     runs-on: macos-26
