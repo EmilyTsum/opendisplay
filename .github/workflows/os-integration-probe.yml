@@ -401,3 +401,8 @@ jobs:
           done
           # Keep focused metadata around codec properties/selectors.
           grep -n -A18 -B12 -E 'codec|setCodec:' "$OUT/SidecarCore-objc.txt" > "$OUT/SidecarCore-codec-objc-context.txt" || true
+      - name: Upload Sidecar codec probe
+        uses: actions/upload-artifact@v6
+        with:
+          name: sidecar-codec-probe
+          path: ${{ runner.temp }}/os-probe/sidecar-codec
