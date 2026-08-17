@@ -1,0 +1,11 @@
+name: Bluetooth Link Monitor Build
+on:
+  push:
+    branches: [research/bluetooth-aac-128k]
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+      - run: clang -fobjc-arc -framework Foundation tools/bluetooth-aac-research/bt-aac-link-monitor.m -o /tmp/bt-aac-link-monitor
+      - run: /tmp/bt-aac-link-monitor 1
