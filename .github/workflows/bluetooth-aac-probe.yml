@@ -1,0 +1,64 @@
+name: Bluetooth AAC Probe
+on:
+  push:
+    branches: [research/bluetooth-aac-128k]
+jobs:
+  probe:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+      - name: Probe current macOS Bluetooth audio internals
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/bt-aac-probe"
+          mkdir -p "$OUT"
+          sw_vers > "$OUT/sw_vers.txt"
+          uname -a > "$OUT/uname.txt"
+          find /System/Library /usr/libexec /usr/sbin -maxdepth 8 \( -iname '*bluetooth*audio*' -o -iname '*btaudio*' -o -iname '*bluetoothaudiod*' \) 2>/dev/null | sort > "$OUT/inventory.txt" || true
+          # Add known/current candidates even if their names are less obvious.
+          candidates=(
+            /usr/libexec/bluetoothaudiod
+            /usr/sbin/bluetoothaudiod
+            /System/Library/Audio/Plug-Ins/HAL/BluetoothAudioPlugIn.driver/Contents/MacOS/BluetoothAudioPlugIn
+            /System/Library/Audio/Plug-Ins/HAL/BluetoothAudioPlugIn.driver/Contents/MacOS/BluetoothAudioPlugInDriver
+            /System/Library/PrivateFrameworks/BluetoothAudio.framework/BluetoothAudio
+            /System/Library/PrivateFrameworks/BluetoothAudioDSP.framework/BluetoothAudioDSP
+            /System/Library/Frameworks/IOBluetooth.framework/IOBluetooth
+          )
+          while IFS= read -r p; do candidates+=("$p"); done < "$OUT/inventory.txt"
+          i=0
+          for p in "${candidates[@]}"; do
+            [ -f "$p" ] || continue
+            i=$((i+1)); d="$OUT/bin-$i"; mkdir -p "$d"
+            printf '%s\n' "$p" > "$d/path.txt"
+            file "$p" > "$d/file.txt" || true
+            otool -L "$p" > "$d/otool-L.txt" 2>&1 || true
+            nm -nm "$p" > "$d/nm.txt" 2>&1 || true
+            strings -a "$p" > "$d/strings-all.txt" 2>&1 || true
+            grep -iE 'AAC|MPEG.?4|bit.?rate|128000|128.?kb|256000|320000|VBR|ABR|CBR|A2DP|codec|sample.?rate|quality|AudioConverter|AudioCodec|packet|MTU|EDR|aptX|LDAC|SBC' "$d/strings-all.txt" > "$d/strings-filtered.txt" || true
+            codesign -d --entitlements :- "$p" > "$d/codesign.txt" 2>&1 || true
+          done
+          # Search preference/config plists for old and current knobs.
+          find /System/Library /Library /usr -maxdepth 8 -type f \( -name '*.plist' -o -name '*.strings' \) 2>/dev/null | while read -r p; do
+            if plutil -p "$p" 2>/dev/null | grep -qiE 'AAC|A2DP|bit.?rate|bluetooth.?audio|codec'; then
+              echo "===== $p =====" >> "$OUT/plist-matches.txt"
+              plutil -p "$p" >> "$OUT/plist-matches.txt" 2>/dev/null || true
+            fi
+          done
+          # Legacy domains are useful to know even when absent.
+          for dom in com.apple.BluetoothAudioAgent com.apple.BluetoothAudio com.apple.audio.AudioComponentCache; do
+            echo "===== $dom =====" >> "$OUT/defaults.txt"
+            defaults read "$dom" >> "$OUT/defaults.txt" 2>&1 || true
+          done
+          # Launchd/service names and executable paths.
+          find /System/Library/LaunchDaemons /System/Library/LaunchAgents -type f -name '*.plist' -maxdepth 2 2>/dev/null | while read -r p; do
+            if plutil -p "$p" 2>/dev/null | grep -qiE 'bluetooth.*audio|audio.*bluetooth|bluetoothaudiod'; then
+              echo "===== $p =====" >> "$OUT/launchd.txt"
+              plutil -p "$p" >> "$OUT/launchd.txt" 2>/dev/null || true
+            fi
+          done
+      - uses: actions/upload-artifact@v6
+        with:
+          name: bluetooth-aac-probe
+          path: ${{ runner.temp }}/bt-aac-probe
