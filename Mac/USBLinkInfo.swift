@@ -41,12 +41,29 @@ struct USBLinkInfo: Equatable, Sendable {
     }
 
     static func detectSynchronously(udid: String, locationID: Int? = nil) -> USBLinkInfo? {
-        // Prefer JSON because it is locale-independent. Some macOS releases,
-        // however, omit the device speed from SPUSBDataType's JSON while the
-        // human-readable report still contains `Speed: Up to …`. Fall back to
-        // that report before giving up so the HUD never depends on one schema.
+        // IORegistry is the authoritative source for the negotiated USB line
+        // rate on current macOS (`UsbLinkSpeed` is exposed in bits/sec). It is
+        // also faster and less schema/locale-sensitive than system_profiler.
+        // Keep both profiler paths as fallbacks for older OS/device classes.
+        if let info = detectIORegistry(udid: udid, locationID: locationID) { return info }
         if let info = detectJSON(udid: udid, locationID: locationID) { return info }
         return detectText(udid: udid, locationID: locationID)
+    }
+
+    private static func detectIORegistry(udid: String, locationID: Int?) -> USBLinkInfo? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/ioreg")
+        process.arguments = ["-p", "IOUSB", "-l", "-w0", "-a"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0,
+              let root = try? PropertyListSerialization.propertyList(
+                from: data, options: [], format: nil) else { return nil }
+        return parse(profile: root, udid: udid, locationID: locationID)
     }
 
     private static func detectJSON(udid: String, locationID: Int?) -> USBLinkInfo? {
@@ -126,7 +143,10 @@ struct USBLinkInfo: Equatable, Sendable {
     private static func findDeviceNode(in value: Any, locationID wanted: Int) -> [String: Any]? {
         if let dict = value as? [String: Any] {
             for (key, raw) in dict where key.lowercased().contains("location") {
-                if parseLocationID(from: raw) == wanted { return dict }
+                if let parsed = parseLocationID(from: raw),
+                   UInt32(truncatingIfNeeded: parsed) == UInt32(truncatingIfNeeded: wanted) {
+                    return dict
+                }
             }
             for raw in dict.values {
                 if let found = findDeviceNode(in: raw, locationID: wanted) { return found }
@@ -153,8 +173,25 @@ struct USBLinkInfo: Equatable, Sendable {
     }
 
     private static func findSpeed(in device: [String: Any]) -> Int? {
+        // Current IOUSB registry nodes expose the negotiated line rate as
+        // `UsbLinkSpeed` in bits/sec (for example 12_000_000 or 5_000_000_000).
+        // Prefer that exact value over the coarser USB speed enum.
+        for (key, raw) in device {
+            let compactKey = key.lowercased()
+                .replacingOccurrences(of: " ", with: "")
+                .replacingOccurrences(of: "_", with: "")
+            if compactKey.contains("usblinkspeed") || compactKey == "linkspeed" {
+                if let bps = numericValue(raw), bps >= 1_000_000 {
+                    return Int((bps / 1_000_000.0).rounded())
+                }
+                if let string = raw as? String, let mbps = parseSpeedString(string) {
+                    return mbps
+                }
+            }
+        }
+
         // system_profiler commonly reports strings such as "Up to 480 Mb/s"
-        // or "Up to 5 Gb/s". Search speed-looking fields first.
+        // or "Up to 5 Gb/s". Search speed-looking fields next.
         let ordered = device.sorted { lhs, rhs in
             let l = lhs.key.lowercased()
             let r = rhs.key.lowercased()
@@ -165,10 +202,39 @@ struct USBLinkInfo: Equatable, Sendable {
         for (key, raw) in ordered where key.lowercased().contains("speed") {
             if let string = raw as? String, let mbps = parseSpeedString(string) { return mbps }
         }
+
+        // Last-resort mapping for IOUSB's enum when UsbLinkSpeed is absent.
+        // 0/1/2/3/4/5 correspond to low/full/high/super/super+/USB4-era
+        // classes in the registry. Only use values we can express as a useful
+        // nominal line rate; exact UsbLinkSpeed always wins above.
+        for (key, raw) in device {
+            let compactKey = key.lowercased().replacingOccurrences(of: " ", with: "")
+            guard compactKey == "usbspeed" || compactKey == "devicespeed",
+                  let value = numericValue(raw).map(Int.init) else { continue }
+            switch value {
+            case 0: return 2       // nominal 1.5 Mb/s, rounded for HUD
+            case 1: return 12
+            case 2: return 480
+            case 3: return 5_000
+            case 4: return 10_000
+            case 5: return 20_000
+            default: break
+            }
+        }
+
         // Some macOS versions nest details one level deeper.
         for raw in device.values {
             if let dict = raw as? [String: Any], let mbps = findSpeed(in: dict) { return mbps }
         }
+        return nil
+    }
+
+    private static func numericValue(_ value: Any) -> Double? {
+        if let number = value as? NSNumber { return number.doubleValue }
+        if let int = value as? Int { return Double(int) }
+        if let uint = value as? UInt64 { return Double(uint) }
+        if let double = value as? Double { return double }
+        if let string = value as? String { return Double(string) }
         return nil
     }
 

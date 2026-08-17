@@ -83,4 +83,45 @@ final class USBLinkInfoTests: XCTestCase {
                                          locationID: 0x00100000)
         XCTAssertEqual(info?.megabitsPerSecond, 5_000)
     }
+    func testParsesIORegistryLinkSpeedByLocationID() {
+        let profile: [Any] = [[
+            "IORegistryEntryName": "iPad",
+            "locationID": NSNumber(value: UInt32(0x00100000)),
+            "USB Serial Number": "different-profiler-serial",
+            "UsbLinkSpeed": NSNumber(value: UInt64(5_000_000_000)),
+            "USBSpeed": NSNumber(value: 3),
+        ]]
+        let info = USBLinkInfo.parse(profile: profile,
+                                     udid: "00008110-001234567890001E",
+                                     locationID: 0x00100000)
+        XCTAssertEqual(info?.megabitsPerSecond, 5_000)
+        XCTAssertEqual(info?.hudLabel, "USB · 5 Gb/s")
+    }
+
+    func testIORegistryExactLinkSpeedWinsOverSpeedEnum() {
+        let profile: [Any] = [[
+            "USB Serial Number": "00008110001234567890001E",
+            "locationID": NSNumber(value: UInt32(0x00100000)),
+            "UsbLinkSpeed": NSNumber(value: UInt64(10_000_000_000)),
+            "USBSpeed": NSNumber(value: 3),
+        ]]
+        let info = USBLinkInfo.parse(profile: profile,
+                                     udid: "00008110-001234567890001E",
+                                     locationID: 0x00100000)
+        XCTAssertEqual(info?.megabitsPerSecond, 10_000)
+    }
+
+    func testLocationIDComparisonUses32BitTopologyValue() {
+        let unsigned = UInt32(0xF1200000)
+        let signed = Int(Int32(bitPattern: unsigned))
+        let profile: [Any] = [[
+            "locationID": NSNumber(value: signed),
+            "UsbLinkSpeed": NSNumber(value: UInt64(480_000_000)),
+        ]]
+        let info = USBLinkInfo.parse(profile: profile,
+                                     udid: "missing",
+                                     locationID: Int(unsigned))
+        XCTAssertEqual(info?.megabitsPerSecond, 480)
+    }
+
 }
