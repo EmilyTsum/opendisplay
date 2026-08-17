@@ -18,7 +18,7 @@ jobs:
           #import <objc/runtime.h>
           #import <dlfcn.h>
           static NSSet *classes(void) {
-            int n=objc_getClassList(NULL,0); Class *c=calloc(n,sizeof(Class)); objc_getClassList(c,n);
+            int n=objc_getClassList(NULL,0); Class *c=(Class *)calloc(n,sizeof(Class)); objc_getClassList(c,n);
             NSMutableSet *s=[NSMutableSet set]; for(int i=0;i<n;i++) [s addObject:NSStringFromClass(c[i])]; free(c); return s;
           }
           static BOOL interesting(NSString *s) {
