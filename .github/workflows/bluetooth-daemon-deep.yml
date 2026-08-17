@@ -1,0 +1,27 @@
+name: Bluetooth Daemon Deep Probe
+on:
+  push:
+    branches: [research/bluetooth-aac-128k]
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Inspect bluetoothaudiod link quality paths
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/bt-daemon-deep"; mkdir -p "$OUT"
+          BIN=/usr/sbin/bluetoothaudiod
+          strings -a -t x "$BIN" > "$OUT/strings.txt"
+          grep -iE 'audio.?link.?quality|link.?quality|bit.?rate|codec.?type|retransmit|rssi|noise|jitter|A2DP|LinkAdapt|EncoderRate|AAC|bandwidth' "$OUT/strings.txt" > "$OUT/hits.txt" || true
+          nm -nm "$BIN" > "$OUT/nm.txt" 2>&1 || true
+          otool -ov "$BIN" > "$OUT/objc.txt" 2>&1 || true
+          otool -tvV "$BIN" > "$OUT/disasm.txt" 2>&1 || true
+          grep -n -B30 -A80 -E 'audioLinkQuality|bitRate|setBitRate|LinkAdapt|A2DP|AAC' "$OUT/disasm.txt" > "$OUT/disasm-context.txt" || true
+          grep -n -B8 -A20 -E 'audioLinkQualityArray|CBAudioLinkQualityInfo|setBitRate:|setCodecType:' "$OUT/objc.txt" > "$OUT/objc-context.txt" || true
+      - uses: actions/upload-artifact@v6
+        with:
+          name: bluetooth-daemon-deep
+          path: ${{ runner.temp }}/bt-daemon-deep
