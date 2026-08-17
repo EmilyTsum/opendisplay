@@ -1,0 +1,30 @@
+name: Bluetooth AAC Config Format Probe
+on:
+  push:
+    branches: [research/bluetooth-aac-128k]
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Trace bluetoothd AAC config parsing
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/bt-aac-config"; mkdir -p "$OUT"
+          P=/usr/sbin/bluetoothd
+          [ -f "$P" ] || P=/usr/libexec/bluetoothd
+          cp "$P" "$OUT/bluetoothd"
+          strings -a -t x "$P" > "$OUT/strings.txt"
+          otool -tvV "$P" > "$OUT/disasm.txt"
+          grep -n -B80 -A120 -E 'LinkAdaptiveBitrateAAC|DisableAdaptiveEncoderBitrate|Setting custom AAC Link Adaptive bitrate thresholds|Setting custom AAC Link Adaptive bitrates|Setting default AAC Link Adaptive rates' "$OUT/strings.txt" > "$OUT/string-context.txt" || true
+          # All preference/config strings near the adaptive logic.
+          grep -n -iE 'defaults|adaptive|bitrate|threshold|retrans|AAC|encoder' "$OUT/strings.txt" | grep -E 'LinkAdaptive|AdaptiveEncoder|AAC Link|threshold|bitrateCount|defaults write|DisableAdaptive' > "$OUT/filtered.txt" || true
+          # Discover instructions referencing cstring addresses by parsing otool's literal-pool comments.
+          grep -n -B80 -A180 -E 'LinkAdaptiveBitrateAAC|DisableAdaptiveEncoderBitrate|Setting custom AAC Link Adaptive|Setting default AAC Link Adaptive|Fail to load Bitrate Configs|Invalid AAC Config' "$OUT/disasm.txt" > "$OUT/disasm-context.txt" || true
+          nm -m "$P" | grep -iE 'CFPreferences|NSUserDefaults|defaults|adaptive|bitrate' > "$OUT/nm.txt" || true
+      - uses: actions/upload-artifact@v6
+        with:
+          name: bluetooth-aac-config-format
+          path: ${{ runner.temp }}/bt-aac-config
