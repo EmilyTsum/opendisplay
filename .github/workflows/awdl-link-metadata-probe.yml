@@ -46,5 +46,8 @@ jobs:
           echo '== WiFiPeerToPeer runtime =='
           clang -fno-objc-arc -framework Foundation tools/os-integration-research/wifip2p-runtime-dump.m -o /tmp/wifip2p-runtime-dump
           /tmp/wifip2p-runtime-dump | head -1200
+          echo '== AWDL read probe =='
+          clang -fno-objc-arc -framework Foundation tools/os-integration-research/awdl-read-probe.m -o /tmp/awdl-read-probe
+          /tmp/awdl-read-probe | head -500
           echo '== system profiler wifi =='
           system_profiler SPAirPortDataType -detailLevel full | head -1000
