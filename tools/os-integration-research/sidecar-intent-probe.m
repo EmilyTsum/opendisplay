@@ -3,11 +3,13 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 
-static id call0(id obj, const char *sel) {
-    return ((id(*)(id,SEL))objc_msgSend)(obj, sel_registerName(sel));
+static id call0(id obj, const char *name) {
+    SEL sel=sel_registerName(name);
+    return [obj respondsToSelector:sel] ? ((id(*)(id,SEL))objc_msgSend)(obj, sel) : nil;
 }
-static long callLong0(id obj, const char *sel) {
-    return ((long(*)(id,SEL))objc_msgSend)(obj, sel_registerName(sel));
+static long callLong0(id obj, const char *name) {
+    SEL sel=sel_registerName(name);
+    return [obj respondsToSelector:sel] ? ((long(*)(id,SEL))objc_msgSend)(obj, sel) : -1;
 }
 static NSString *callString0(id obj, const char *sel) {
     id value = call0(obj, sel);
@@ -36,9 +38,10 @@ static void darwinCallback(CFNotificationCenterRef center, void *observer,
     dumpState(manager, [NSString stringWithFormat:@"darwin:%@", (__bridge NSString *)name]);
 }
 int main(int argc, const char **argv) { @autoreleasepool {
-    void *handle = dlopen("/System/Library/PrivateFrameworks/SidecarCore.framework/SidecarCore",
-                          RTLD_LAZY | RTLD_LOCAL);
+    void *handle = dlopen("/System/Library/PrivateFrameworks/SidecarCore.framework/SidecarCore", RTLD_LAZY | RTLD_LOCAL);
+    if (!handle) handle = dlopen("/System/Library/PrivateFrameworks/SidecarCore.framework/Versions/A/SidecarCore", RTLD_LAZY | RTLD_LOCAL);
     if (!handle) { fprintf(stderr, "SidecarCore dlopen failed: %s\n", dlerror()); return 1; }
+    fprintf(stdout,"host=%s\n",[[NSProcessInfo processInfo].operatingSystemVersionString UTF8String]);
     Class cls = NSClassFromString(@"SidecarDisplayManager");
     if (!cls) { fprintf(stderr, "SidecarDisplayManager missing\n"); return 2; }
     id manager = call0((id)cls, "sharedManager");

@@ -2,9 +2,9 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 
-static id call0(id o,const char*s){return ((id(*)(id,SEL))objc_msgSend)(o,sel_registerName(s));}
+static id call0(id o,const char*s){ SEL sel=sel_registerName(s); return [o respondsToSelector:sel] ? ((id(*)(id,SEL))objc_msgSend)(o,sel) : nil; }
 static id call1(id o,const char*s,id a){return ((id(*)(id,SEL,id))objc_msgSend)(o,sel_registerName(s),a);}
-static long callLong0(id o,const char*s){return ((long(*)(id,SEL))objc_msgSend)(o,sel_registerName(s));}
+static long callLong0(id o,const char*s){ SEL sel=sel_registerName(s); return [o respondsToSelector:sel] ? ((long(*)(id,SEL))objc_msgSend)(o,sel) : -1; }
 static NSString *desc(id v){return v ? [v description] : @"<nil>";}
 
 static void printConfig(id cfg) {
@@ -22,15 +22,21 @@ static void printConfig(id cfg) {
     const char *codecName = codecValue == 0 ? "H.264" : (codecValue == 1 ? "HEVC" : "unknown");
     printf("  %-30s %s (%s)\n", "codec", desc(codec).UTF8String, codecName);
     printf("  %-30s %ld\n", "transport", callLong0(cfg,"transport"));
-    CGSize size=((CGSize(*)(id,SEL))objc_msgSend)(cfg,sel_registerName("size"));
-    double scale=((double(*)(id,SEL))objc_msgSend)(cfg,sel_registerName("scale"));
-    printf("  %-30s %.0fx%.0f\n", "size", size.width,size.height);
-    printf("  %-30s %.3f\n", "scale", scale);
+    if([cfg respondsToSelector:sel_registerName("size")]) {
+      CGSize size=((CGSize(*)(id,SEL))objc_msgSend)(cfg,sel_registerName("size"));
+      printf("  %-30s %.0fx%.0f\n", "size", size.width,size.height);
+    } else printf("  %-30s <missing>\n", "size");
+    if([cfg respondsToSelector:sel_registerName("scale")]) {
+      double scale=((double(*)(id,SEL))objc_msgSend)(cfg,sel_registerName("scale"));
+      printf("  %-30s %.3f\n", "scale", scale);
+    } else printf("  %-30s <missing>\n", "scale");
 }
 
 int main(void) { @autoreleasepool {
     void *h=dlopen("/System/Library/PrivateFrameworks/SidecarCore.framework/SidecarCore",RTLD_LAZY|RTLD_LOCAL);
+    if(!h) h=dlopen("/System/Library/PrivateFrameworks/SidecarCore.framework/Versions/A/SidecarCore",RTLD_LAZY|RTLD_LOCAL);
     if(!h){fprintf(stderr,"SidecarCore: %s\n",dlerror());return 1;}
+    printf("host=%s\n",[[NSProcessInfo processInfo].operatingSystemVersionString UTF8String]);
     Class mc=NSClassFromString(@"SidecarDisplayManager");
     id mgr=call0((id)mc,"sharedManager");
     NSArray *devices=call0(mgr,"devices") ?: @[];
