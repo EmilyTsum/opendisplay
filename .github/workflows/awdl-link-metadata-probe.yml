@@ -44,7 +44,7 @@ jobs:
             nm -gU "$f" 2>/dev/null | grep -Ei '80211|awdl|peer|channel|rate|rssi' | head -500 || true
           done
           echo '== WiFiPeerToPeer runtime =='
-          clang -fobjc-arc -framework Foundation tools/os-integration-research/wifip2p-runtime-dump.m -o /tmp/wifip2p-runtime-dump
+          clang -fno-objc-arc -framework Foundation tools/os-integration-research/wifip2p-runtime-dump.m -o /tmp/wifip2p-runtime-dump
           /tmp/wifip2p-runtime-dump | head -1200
           echo '== system profiler wifi =='
           system_profiler SPAirPortDataType -detailLevel full | head -1000
