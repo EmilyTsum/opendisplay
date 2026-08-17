@@ -293,6 +293,46 @@ jobs:
           SRC
           clang -fobjc-arc -framework Foundation "$RUNNER_TEMP/sidecar_config.m" -o "$RUNNER_TEMP/sidecar_config"
           "$RUNNER_TEMP/sidecar_config" > "$OUT/sidecar-config.txt" 2>&1 || true
+      - name: Probe unentitled Sidecar custom-config connect path with fake device
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/os-probe/runtime"
+          cat > "$RUNNER_TEMP/sidecar_connect_config.m" <<'SRC'
+          #import <Foundation/Foundation.h>
+          #import <objc/message.h>
+          #import <dlfcn.h>
+          static id call0(id o,const char*s){return ((id(*)(id,SEL))objc_msgSend)(o,sel_registerName(s));}
+          static void setObj(id o,const char*s,id v){((void(*)(id,SEL,id))objc_msgSend)(o,sel_registerName(s),v);}
+          int main(void){@autoreleasepool{
+            dlopen("/System/Library/PrivateFrameworks/SidecarCore.framework/SidecarCore",RTLD_LAZY|RTLD_LOCAL);
+            Class mc=NSClassFromString(@"SidecarDisplayManager"), dc=NSClassFromString(@"SidecarDevice"), cc=NSClassFromString(@"SidecarDisplayConfig");
+            id mgr=call0((id)mc,"sharedManager");
+            id dev=((id(*)(id,SEL,id,id,id))objc_msgSend)(call0((id)dc,"alloc"),sel_registerName("initWithIdentifier:model:name:"),[NSUUID UUID],@"iPad13,8",@"OpenDisplay Fake Probe");
+            id cfg=call0(call0((id)cc,"alloc"),"init");
+            setObj(cfg,"setDevice:",dev);
+            setObj(cfg,"setFramerate:",@120);
+            setObj(cfg,"setTxMaxBitrate:",@100000000);
+            setObj(cfg,"setTxMinBitrate:",@10000000);
+            setObj(cfg,"setLowLatency:",@YES);
+            setObj(cfg,"setEnableTimeSync:",@YES);
+            printf("cfg framerate=%s txMax=%s txMin=%s lowLatency=%s timeSync=%s\n",
+              [[call0(cfg,"framerate") description] UTF8String],[[call0(cfg,"txMaxBitrate") description] UTF8String],
+              [[call0(cfg,"txMinBitrate") description] UTF8String],[[call0(cfg,"lowLatency") description] UTF8String],
+              [[call0(cfg,"enableTimeSync") description] UTF8String]);
+            __block BOOL called=NO;
+            void (^completion)(NSError *)=^(NSError *error){called=YES; printf("completion error=%s\n",error?error.description.UTF8String:"nil");};
+            @try {
+              ((void(*)(id,SEL,id,id,id))objc_msgSend)(mgr,sel_registerName("connectToDevice:withConfig:completion:"),dev,cfg,completion);
+              puts("connect_invoked=1");
+            } @catch(NSException *e) { printf("exception=%s\n",e.reason.UTF8String); }
+            NSDate *until=[NSDate dateWithTimeIntervalSinceNow:3.0];
+            while(!called && [until timeIntervalSinceNow]>0) [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+            printf("completion_final=%d\n",called);
+          }return 0;}
+          SRC
+          clang -fobjc-arc -framework Foundation "$RUNNER_TEMP/sidecar_connect_config.m" -o "$RUNNER_TEMP/sidecar_connect_config"
+          "$RUNNER_TEMP/sidecar_connect_config" > "$OUT/sidecar-connect-config.txt" 2>&1 || true
       - uses: actions/upload-artifact@v4
         with:
           name: os-integration-probe
