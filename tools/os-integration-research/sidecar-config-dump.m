@@ -9,7 +9,7 @@ static NSString *desc(id v){return v ? [v description] : @"<nil>";}
 
 static void printConfig(id cfg) {
     if (!cfg) { puts("  config=<nil>"); return; }
-    const char *keys[]={"framerate","codec","txMaxBitrate","txMinBitrate","lowLatency",
+    const char *keys[]={"framerate","txMaxBitrate","txMinBitrate","lowLatency",
                        "keyFrameInterval","tilesPerFrame","hdr","enableTimeSync","dataLink",
                        "rtcp","rtcpTimeoutInterval","displayID","showSideBar","showTouchBar",
                        "configureDisplayExclusiveMode","service"};
@@ -17,6 +17,10 @@ static void printConfig(id cfg) {
         id v=call0(cfg,keys[i]);
         printf("  %-30s %s\n", keys[i], desc(v).UTF8String);
     }
+    id codec=call0(cfg,"codec");
+    NSInteger codecValue=[codec integerValue];
+    const char *codecName = codecValue == 0 ? "H.264" : (codecValue == 1 ? "HEVC" : "unknown");
+    printf("  %-30s %s (%s)\n", "codec", desc(codec).UTF8String, codecName);
     printf("  %-30s %ld\n", "transport", callLong0(cfg,"transport"));
     CGSize size=((CGSize(*)(id,SEL))objc_msgSend)(cfg,sel_registerName("size"));
     double scale=((double(*)(id,SEL))objc_msgSend)(cfg,sel_registerName("scale"));
