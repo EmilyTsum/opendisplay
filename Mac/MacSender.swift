@@ -135,6 +135,7 @@ struct PhoneInfo: Decodable {
     let maxFPS: Int?      // panel maximum refresh rate (60 / 120 today)
     let codecs: [String]? // receiver-supported codecs, preferred first
     let audioFormats: [String]? // optional additive audio capabilities
+    let audioPort: Int?   // protocol 6 dedicated PCM TCP port; absent on old receivers
     let id: String?       // per-install identity (older receivers omit it) —
                           // lets the controller match the same physical device
                           // across USB and WiFi
@@ -159,6 +160,10 @@ struct PhoneInfo: Decodable {
     var supportsPCM48kStereo: Bool {
         protocolVersion >= WireProtocol.pcmAudioVersion
             && (audioFormats?.contains(StreamAudioFormat.pcmS16LE48kStereo.rawValue) ?? false)
+    }
+    var supportsUltraLowLatencyAudio: Bool {
+        protocolVersion >= WireProtocol.ultraLowLatencyAudioVersion
+            && supportsPCM48kStereo
     }
 }
 
@@ -210,6 +215,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private var encoder: VTCompressionSession?
     private var connection: NWConnection?
+    private var audioConnection: NWConnection?
+    private var audioConnectionReady = false
+    private var audioLaneGeneration: UInt64 = 0
     private var virtualDisplay: VirtualDisplay?
     private let queue = DispatchQueue(label: "sender.video")
     private let startCode: [UInt8] = [0, 0, 0, 1]
@@ -294,8 +302,16 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var audioPacketsSent = 0
     private var audioBytesSent = 0
     private var pendingAudioSends = 0
-    private let maxPendingAudioSends = 4
+    private let maxPendingAudioSends = 2
     private var audioPacketsDropped = 0
+    private var audioPCMAccumulator = Data()
+    private var audioAccumulatorCaptureMs: Double?
+    private var audioSequence: UInt32 = 0
+    private let audioChunkFrames = 240        // 5 ms @ 48 kHz
+    private var audioCaptureBufferMs = 0.0
+    private var audioLaneSendP50 = 0.0
+    private var audioLaneSendP95 = 0.0
+    private var audioSendDurationsThisWindow: [Double] = []
     private let pipelineLock = NSLock()
     private var dropsEncThisWindow = 0
     private var dropsNetThisWindow = 0
@@ -458,6 +474,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 peerSupportsProResLT: info.supportsProResLT,
                 peerSupportsProResProxy: info.supportsProResProxy)
             activeAudio = audioEnabled && info.supportsPCM48kStereo
+            configureAudioLane(for: info)
             let content = try await SCShareableContent.current
             guard let display = content.displays.first else {
                 throw NSError(domain: "MacSender", code: 1,
@@ -512,6 +529,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             peerSupportsProResLT: info.supportsProResLT,
             peerSupportsProResProxy: info.supportsProResProxy)
         activeAudio = audioEnabled && info.supportsPCM48kStereo
+        configureAudioLane(for: info)
         // USB session IDs are based on the hardware UDID while WiFi IDs are
         // based on Bonjour names. Deriving the display serial from either made
         // the *same iPad* become two different virtual monitors depending on
@@ -798,6 +816,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         stream = nil
         connection?.cancel()
         connection = nil
+        cancelAudioLane()
         pendingSends = 0
         pendingProResFrame = nil
         pendingAudioSends = 0
@@ -846,9 +865,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.dialGeneration += 1   // a dial still in flight must not adopt
             self.connection?.cancel()
             self.connection = nil
+            self.cancelAudioLane()
             self.pendingSends = 0
             self.pendingProResFrame = nil
-            self.pendingAudioSends = 0
             self.pipelineLock.lock()
             self.pendingEncodes = 0
             self.pipelineLock.unlock()
@@ -1159,6 +1178,140 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// Protocol 6 opens a second reliable TCP flow for PCM so video cannot
+    /// head-of-line block audio. The flow follows the same physical path as
+    /// the active display transport: required AWDL interface, normal Wi-Fi,
+    /// or a second usbmux connection to the receiver's adjacent port.
+    private func configureAudioLane(for info: PhoneInfo) {
+        guard activeAudio, info.supportsUltraLowLatencyAudio else {
+            cancelAudioLane()
+            return
+        }
+        guard audioConnection == nil else { return }
+        audioLaneGeneration &+= 1
+        let generation = audioLaneGeneration
+
+        switch transport {
+        case .tcp(let endpoint, let requiredInterface):
+            let target: NWEndpoint
+            switch endpoint {
+            case .service(let name, _, let domain, _):
+                target = .service(name: name, type: "_opensidecar-audio._tcp",
+                                  domain: domain, interface: nil)
+            case .hostPort(let host, _):
+                guard let raw = info.audioPort, raw > 0, raw <= Int(UInt16.max),
+                      let port = NWEndpoint.Port(rawValue: UInt16(raw)) else {
+                    Log.info("receiver did not provide a usable audio port — keeping inline PCM")
+                    return
+                }
+                target = .hostPort(host: host, port: port)
+            default:
+                Log.info("unsupported endpoint for dedicated audio lane — keeping inline PCM")
+                return
+            }
+            let tcp = NWProtocolTCP.Options()
+            tcp.noDelay = true
+            let params = NWParameters(tls: nil, tcp: tcp)
+            params.serviceClass = .responsiveData
+            if let requiredInterface {
+                params.includePeerToPeer = true
+                params.requiredInterface = requiredInterface
+            }
+            let conn = NWConnection(to: target, using: params)
+            audioConnection = conn
+            conn.stateUpdateHandler = { [weak self, weak conn] state in
+                guard let self, let conn, generation == self.audioLaneGeneration,
+                      self.audioConnection === conn else { return }
+                switch state {
+                case .ready:
+                    self.audioConnectionReady = true
+                    Log.info("dedicated PCM audio lane ready")
+                case .failed(let error):
+                    Log.info("dedicated PCM audio lane failed: \(error) — falling back inline")
+                    self.audioConnectionReady = false
+                    self.audioConnection = nil
+                    self.scheduleAudioLaneRetry()
+                case .waiting(let error):
+                    Log.info("dedicated PCM audio lane waiting: \(error) — retrying")
+                    self.audioConnectionReady = false
+                    self.audioConnection = nil
+                    conn.cancel()
+                    self.scheduleAudioLaneRetry()
+                case .cancelled:
+                    self.audioConnectionReady = false
+                    if self.audioConnection === conn { self.audioConnection = nil }
+                default: break
+                }
+            }
+            conn.start(queue: queue)
+
+        case .usb(let configuredUDID, _):
+            guard let raw = info.audioPort, raw > 0, raw <= Int(UInt16.max) else {
+                Log.info("receiver did not provide a usable USB audio port — keeping inline PCM")
+                return
+            }
+            let udid = connectedUSBUDID ?? configuredUDID
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let (conn, _) = try await Usbmux.dial(udid: udid, port: UInt16(raw), queue: queue)
+                    self.queue.async { [weak self] in
+                        guard let self, generation == self.audioLaneGeneration, !self.stopped else {
+                            conn.cancel(); return
+                        }
+                        self.audioConnection = conn
+                        self.audioConnectionReady = true
+                        conn.stateUpdateHandler = { [weak self, weak conn] state in
+                            guard let self, let conn, generation == self.audioLaneGeneration,
+                                  self.audioConnection === conn else { return }
+                            switch state {
+                            case .failed(let error):
+                                Log.info("USB PCM audio lane failed: \(error) — falling back inline")
+                                self.audioConnectionReady = false
+                                self.audioConnection = nil
+                                self.scheduleAudioLaneRetry()
+                            case .cancelled:
+                                self.audioConnectionReady = false
+                                if self.audioConnection === conn { self.audioConnection = nil }
+                            default: break
+                            }
+                        }
+                        Log.info("dedicated USB PCM audio lane ready")
+                    }
+                } catch {
+                    self.queue.async { [weak self] in
+                        guard let self, generation == self.audioLaneGeneration else { return }
+                        self.audioConnectionReady = false
+                        self.audioConnection = nil
+                        Log.info("USB PCM audio lane dial failed: \(error) — keeping inline PCM")
+                        self.scheduleAudioLaneRetry()
+                    }
+                }
+            }
+        }
+    }
+
+    private func scheduleAudioLaneRetry() {
+        guard activeAudio, connectionReady, !stopped else { return }
+        let generation = audioLaneGeneration
+        queue.asyncAfter(deadline: .now() + 0.75) { [weak self] in
+            guard let self, generation == self.audioLaneGeneration,
+                  self.audioConnection == nil, let info = self.lastHello,
+                  self.connectionReady, !self.stopped else { return }
+            self.configureAudioLane(for: info)
+        }
+    }
+
+    private func cancelAudioLane() {
+        audioLaneGeneration &+= 1
+        audioConnectionReady = false
+        audioConnection?.cancel()
+        audioConnection = nil
+        pendingAudioSends = 0
+        audioPCMAccumulator.removeAll(keepingCapacity: true)
+        audioAccumulatorCaptureMs = nil
+    }
+
     private func scheduleReconnect() {
         guard !stopped else { return }
         if everConnected {
@@ -1177,9 +1330,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let generation = dialGeneration
         connection?.cancel()
         connection = nil
+        cancelAudioLane()
         pendingSends = 0
         pendingProResFrame = nil
-        pendingAudioSends = 0
         pipelineLock.lock()
         pendingEncodes = 0
         pipelineLock.unlock()
@@ -1231,6 +1384,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.proResSendDurationsThisWindow.removeAll(keepingCapacity: true)
                 self.proResFrameBytesThisWindow.removeAll(keepingCapacity: true)
 
+                let audioSorted = self.audioSendDurationsThisWindow.sorted()
+                let audioSend50 = audioSorted.isEmpty ? 0 : audioSorted[audioSorted.count / 2]
+                let audioSend95 = audioSorted.isEmpty ? 0 : audioSorted[min(audioSorted.count - 1, Int(Double(audioSorted.count) * 0.95))]
+                self.audioLaneSendP50 = audioSend50
+                self.audioLaneSendP95 = audioSend95
+                self.audioSendDurationsThisWindow.removeAll(keepingCapacity: true)
+
                 let sorted = self.inputLatencies.sorted()
                 let inp50 = sorted.isEmpty ? 0 : sorted[sorted.count / 2].rounded()
                 let inp95 = sorted.isEmpty ? 0 : sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.95))].rounded()
@@ -1249,7 +1409,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 case .tcp(_, let requiredInterface):
                     transportLabel = requiredInterface == nil ? "WiFi" : "AWDL"
                 }
-                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps),\"encFps\":\(encFps),\"encMs50\":\(enc50),\"encMs95\":\(enc95),\"encInFlight\":\(encodeInflightNow),\"encPeak\":\(encodeInflightPeak),\"encLimit\":\(self.maxPendingEncodes),\"wireMs50\":\(wire50),\"wireMs95\":\(wire95),\"frameKB\":\(frameKB),\"usbMbps\":\(usbMbps),\"usbLink\":\"\(usbLink)\",\"audioTxDrops\":\(self.audioPacketsDropped),\"transport\":\"\(transportLabel)\"}")
+                let audioLane = self.audioConnectionReady ? "dedicated" : "inline"
+                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps),\"encFps\":\(encFps),\"encMs50\":\(enc50),\"encMs95\":\(enc95),\"encInFlight\":\(encodeInflightNow),\"encPeak\":\(encodeInflightPeak),\"encLimit\":\(self.maxPendingEncodes),\"wireMs50\":\(wire50),\"wireMs95\":\(wire95),\"frameKB\":\(frameKB),\"usbMbps\":\(usbMbps),\"usbLink\":\"\(usbLink)\",\"audioTxDrops\":\(self.audioPacketsDropped),\"audioLane\":\"\(audioLane)\",\"audioCapMs\":\(self.audioCaptureBufferMs),\"audioSend50\":\(audioSend50),\"audioSend95\":\(audioSend95),\"transport\":\"\(transportLabel)\"}")
             }
             self.schedulePing()
         }
@@ -1676,9 +1837,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     /// ScreenCaptureKit is configured to deliver 48 kHz stereo. It exposes
-    /// audio as Float32 PCM buffers; convert to compact signed 16-bit
-    /// interleaved PCM before putting it on the wire. At 48k/2ch this is only
-    /// 1.536 Mbit/s, so keeping it lossless is cheap even beside ProRes video.
+    /// audio as Float32 PCM buffers; convert to signed 16-bit interleaved PCM.
+    /// Protocol 6 then slices each callback into 5 ms chunks and sends them on
+    /// a dedicated TCP flow. Smaller chunks do not make SCK capture itself
+    /// faster, but they prevent one large callback from becoming one large
+    /// receiver scheduling unit and expose the true capture granularity in HUD.
     private func handleAudioSample(_ sampleBuffer: CMSampleBuffer) {
         guard activeAudio, connectionReady else { return }
         do {
@@ -1707,50 +1870,115 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                         out[frame * 2 + 1] = Int16((r * Float(Int16.max)).rounded()).littleEndian
                     }
                 }
-                sendAudioPCM(samples)
+
+                let bufferMs = Double(frameCount) * 1000.0 / 48_000.0
+                // SCK delivers the callback at/after the end of this PCM span.
+                // Back-estimate the first sample's wall time for latency HUD.
+                let captureStartMs = Date().timeIntervalSince1970 * 1000.0 - bufferMs
+                queue.async { [weak self] in
+                    guard let self, self.activeAudio, self.connectionReady else { return }
+                    self.audioCaptureBufferMs = bufferMs
+                    if self.lastHello?.supportsUltraLowLatencyAudio == true {
+                        self.enqueueUltraLowLatencyPCM(samples, captureStartMs: captureStartMs)
+                    } else {
+                        self.sendLegacyAudioPCM(samples)
+                    }
+                }
             }
         } catch {
             Log.info("audio sample conversion failed: \(error)")
         }
     }
 
-    /// Wire payload: [ODAU][u32 sampleRate][u16 channels][u16 bits][PCM...].
-    /// The normal outer OpenDisplay u32 frame length still wraps this packet.
-    private func sendAudioPCM(_ pcm: Data) {
+    /// Keep a timestamp for the first frame in the accumulator, then emit
+    /// fixed 5 ms packets. State lives on the sender queue, not the SCK audio
+    /// callback queue, so transport switches and reconnects remain serialized.
+    private func enqueueUltraLowLatencyPCM(_ pcm: Data, captureStartMs: Double) {
+        let bytesPerFrame = 2 * MemoryLayout<Int16>.size
+        let chunkBytes = audioChunkFrames * bytesPerFrame
+        if audioPCMAccumulator.isEmpty { audioAccumulatorCaptureMs = captureStartMs }
+        audioPCMAccumulator.append(pcm)
+
+        while audioPCMAccumulator.count >= chunkBytes {
+            let chunk = Data(audioPCMAccumulator.prefix(chunkBytes))
+            audioPCMAccumulator.removeFirst(chunkBytes)
+            let chunkCaptureMs = audioAccumulatorCaptureMs ?? captureStartMs
+            sendAudioPCM(chunk, captureMs: Int64(chunkCaptureMs.rounded()))
+            audioAccumulatorCaptureMs = chunkCaptureMs
+                + Double(audioChunkFrames) * 1000.0 / 48_000.0
+        }
+        if audioPCMAccumulator.isEmpty { audioAccumulatorCaptureMs = nil }
+    }
+
+    private func sendLegacyAudioPCM(_ pcm: Data) {
         var payload = Data("ODAU".utf8)
+        appendAudioFormatHeader(to: &payload)
+        payload.append(pcm)
+        sendFramedAudioPayload(payload)
+    }
+
+    /// Protocol 6 payload:
+    /// [ODA2][u32 rate][u16 channels][u16 bits][u32 sequence]
+    /// [i64 captureWallMs][S16LE interleaved PCM]
+    private func sendAudioPCM(_ pcm: Data, captureMs: Int64) {
+        var payload = Data("ODA2".utf8)
+        appendAudioFormatHeader(to: &payload)
+        var sequence = audioSequence.bigEndian
+        var capture = captureMs.bigEndian
+        payload.append(Data(bytes: &sequence, count: 4))
+        payload.append(Data(bytes: &capture, count: 8))
+        payload.append(pcm)
+        audioSequence &+= 1
+        sendFramedAudioPayload(payload)
+    }
+
+    private func appendAudioFormatHeader(to payload: inout Data) {
         var sampleRate = UInt32(48_000).bigEndian
         var channels = UInt16(2).bigEndian
         var bits = UInt16(16).bigEndian
         payload.append(Data(bytes: &sampleRate, count: 4))
         payload.append(Data(bytes: &channels, count: 2))
         payload.append(Data(bytes: &bits, count: 2))
-        payload.append(pcm)
+    }
 
-        queue.async { [weak self] in
-            guard let self, self.activeAudio, self.connectionReady,
-                  let connection = self.connection else { return }
-            guard self.pendingAudioSends < self.maxPendingAudioSends else {
-                self.audioPacketsDropped += 1
-                return
-            }
-            var length = UInt32(payload.count).bigEndian
-            var frame = Data(bytes: &length, count: 4)
-            frame.append(payload)
-            self.pendingAudioSends += 1
-            connection.send(content: frame, completion: .contentProcessed { [weak self] error in
-                guard let self else { return }
-                self.queue.async {
-                    guard self.connection === connection else { return }
-                    self.pendingAudioSends = max(0, self.pendingAudioSends - 1)
-                    if let error {
-                        Log.info("audio send error: \(error)")
-                    } else {
-                        self.audioPacketsSent += 1
-                        self.audioBytesSent += frame.count
-                    }
-                }
-            })
+    private func sendFramedAudioPayload(_ payload: Data) {
+        guard activeAudio, connectionReady else { return }
+        let dedicated = audioConnectionReady ? audioConnection : nil
+        guard let target = dedicated ?? connection else { return }
+        guard pendingAudioSends < maxPendingAudioSends else {
+            audioPacketsDropped += 1
+            return
         }
+        var length = UInt32(payload.count).bigEndian
+        var frame = Data(bytes: &length, count: 4)
+        frame.append(payload)
+        pendingAudioSends += 1
+        let sendStartedAt = ProcessInfo.processInfo.systemUptime
+        target.send(content: frame, completion: .contentProcessed { [weak self, weak target] error in
+            guard let self, let target else { return }
+            self.queue.async {
+                let stillCurrent = (self.audioConnection === target) ||
+                    (!self.audioConnectionReady && self.connection === target)
+                guard stillCurrent else { return }
+                self.pendingAudioSends = max(0, self.pendingAudioSends - 1)
+                let sendMs = (ProcessInfo.processInfo.systemUptime - sendStartedAt) * 1000
+                self.audioSendDurationsThisWindow.append(sendMs)
+                if self.audioSendDurationsThisWindow.count > 240 {
+                    self.audioSendDurationsThisWindow.removeFirst(
+                        self.audioSendDurationsThisWindow.count - 240)
+                }
+                if let error {
+                    Log.info("audio send error: \(error)")
+                    if self.audioConnection === target {
+                        self.audioConnectionReady = false
+                        self.audioConnection = nil
+                    }
+                } else {
+                    self.audioPacketsSent += 1
+                    self.audioBytesSent += frame.count
+                }
+            }
+        })
     }
 
     private func isPipelineBackedUp() -> Bool {

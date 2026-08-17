@@ -54,7 +54,7 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSUIElement: true
         NSLocalNetworkUsageDescription: OpenDisplay connects to your iPad or iPhone over the local network in WiFi mode.
-        NSBonjourServices: ["_opensidecar._tcp"]
+        NSBonjourServices: ["_opensidecar._tcp", "_opensidecar-audio._tcp"]
         LSApplicationCategoryType: public.app-category.utilities
         # --- Sparkle auto-update (issue #52) ---
         # The appcast feed is hosted on the landing-page site at the custom
@@ -126,7 +126,7 @@ targets:
         UILaunchScreen: {}
         UIRequiresFullScreen: true
         NSLocalNetworkUsageDescription: OpenDisplay advertises itself on the local network so your Mac can connect over WiFi.
-        NSBonjourServices: ["_opensidecar._tcp"]
+        NSBonjourServices: ["_opensidecar._tcp", "_opensidecar-audio._tcp"]
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft

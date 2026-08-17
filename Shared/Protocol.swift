@@ -11,7 +11,7 @@ import Foundation
 /// protocol 1 — that's every install in the field that predates the handshake.
 enum WireProtocol {
     /// The protocol version this build speaks.
-    static let version = 5
+    static let version = 6
 
     /// Protocol version that introduced Apple Pencil / proximity wire messages.
     /// Peers below this get pencil input as legacy `touch` events.
@@ -24,6 +24,10 @@ enum WireProtocol {
 
     /// Protocol version that introduced low-latency stereo PCM audio packets.
     static let pcmAudioVersion = 5
+
+    /// Protocol version that introduced a dedicated low-latency audio lane,
+    /// packet timestamps, and shallow receiver buffering.
+    static let ultraLowLatencyAudioVersion = 6
 
     /// Oldest peer protocol version this build still supports. Stays at 1
     /// (support everything) until a deliberate two-phase breaking change
@@ -67,4 +71,5 @@ enum WireMessage {
     static let updateRequired = "updateRequired"    // Mac -> phone: peer is below the Mac's floor
     static let sleeping = "sleeping"                // phone -> Mac: device locked, reconnect on wake
     static let closing = "closing"                  // phone -> Mac: app quit, end the session for good
+    static let audioLane = "audioLane"              // Mac -> phone, first frame on auxiliary TCP connection
 }
