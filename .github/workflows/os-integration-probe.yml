@@ -92,6 +92,40 @@ jobs:
           SRC
           clang -fobjc-arc -framework Foundation "$RUNNER_TEMP/probe.m" -o "$RUNNER_TEMP/probe"
           "$RUNNER_TEMP/probe" > "$OUT/classes-methods.txt" 2>&1 || true
+      - name: Safely call Sidecar discovery getters from an unentitled process
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/os-probe/runtime"
+          cat > "$RUNNER_TEMP/sidecar_getters.m" <<'SRC'
+          #import <Foundation/Foundation.h>
+          #import <objc/message.h>
+          #import <dlfcn.h>
+          static id call0(id obj, SEL sel) { return ((id(*)(id,SEL))objc_msgSend)(obj,sel); }
+          static BOOL callBool0(id obj, SEL sel) { return ((BOOL(*)(id,SEL))objc_msgSend)(obj,sel); }
+          int main(void) { @autoreleasepool {
+            void *h=dlopen("/System/Library/PrivateFrameworks/SidecarCore.framework/SidecarCore", RTLD_LAZY|RTLD_LOCAL);
+            printf("dlopen=%s\n",h?"OK":(dlerror()?:"ERR"));
+            Class mgr=NSClassFromString(@"SidecarDisplayManager");
+            Class dev=NSClassFromString(@"SidecarDevice");
+            if (!mgr) { puts("manager_class=nil"); return 0; }
+            BOOL supported=callBool0((id)mgr, NSSelectorFromString(@"isSupported"));
+            id shared=call0((id)mgr, NSSelectorFromString(@"sharedManager"));
+            printf("isSupported=%d shared=%s\n",supported, shared?"OK":"nil");
+            for (NSString *name in @[@"devices",@"recentDevices",@"connectedDevices"]) {
+              @try {
+                id v=call0(shared,NSSelectorFromString(name));
+                printf("%s=%s count=%ld desc=%s\n",name.UTF8String,v?object_getClassName(v):"nil",[v respondsToSelector:@selector(count)]?(long)[v count]:-1,[[v description] UTF8String]);
+              } @catch(NSException *e) { printf("%s EXCEPTION %s\n",name.UTF8String,e.reason.UTF8String); }
+            }
+            if (dev) {
+              @try { id all=call0((id)dev,NSSelectorFromString(@"allDevices")); printf("SidecarDevice.allDevices count=%ld desc=%s\n",[all respondsToSelector:@selector(count)]?(long)[all count]:-1,[[all description] UTF8String]); }
+              @catch(NSException *e) { printf("allDevices EXCEPTION %s\n",e.reason.UTF8String); }
+            }
+          } return 0; }
+          SRC
+          clang -fobjc-arc -framework Foundation "$RUNNER_TEMP/sidecar_getters.m" -o "$RUNNER_TEMP/sidecar_getters"
+          "$RUNNER_TEMP/sidecar_getters" > "$OUT/sidecar-getters.txt" 2>&1 || true
       - uses: actions/upload-artifact@v4
         with:
           name: os-integration-probe
