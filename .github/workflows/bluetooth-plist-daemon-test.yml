@@ -1,0 +1,37 @@
+name: Bluetooth Plist Daemon Test
+on:
+  push:
+    branches: [research/bluetooth-aac-128k]
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify bluetoothd reloads nested overrides
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PLIST=/Library/Preferences/com.apple.Bluetooth.plist
+          sudo /usr/libexec/PlistBuddy -c 'Add :A2DP dict' "$PLIST" 2>/dev/null || true
+          sudo /usr/libexec/PlistBuddy -c 'Delete :A2DP:AACBitrate' "$PLIST" 2>/dev/null || true
+          sudo /usr/libexec/PlistBuddy -c 'Add :A2DP:AACBitrate integer 256' "$PLIST"
+          sudo /usr/libexec/PlistBuddy -c 'Add :Audio dict' "$PLIST" 2>/dev/null || true
+          sudo /usr/libexec/PlistBuddy -c 'Delete :Audio:DisableAdaptiveEncoderBitrate' "$PLIST" 2>/dev/null || true
+          sudo /usr/libexec/PlistBuddy -c 'Add :Audio:DisableAdaptiveEncoderBitrate bool true' "$PLIST"
+          sudo /usr/libexec/PlistBuddy -c 'Add :LinkAdaptiveBitrateAAC dict' "$PLIST" 2>/dev/null || true
+          for k in configs bitrateCount thresholds rates; do sudo /usr/libexec/PlistBuddy -c "Delete :LinkAdaptiveBitrateAAC:$k" "$PLIST" 2>/dev/null || true; done
+          sudo /usr/libexec/PlistBuddy -c 'Add :LinkAdaptiveBitrateAAC:configs integer 2' "$PLIST"
+          sudo /usr/libexec/PlistBuddy -c 'Add :LinkAdaptiveBitrateAAC:bitrateCount integer 5' "$PLIST"
+          sudo /usr/libexec/PlistBuddy -c 'Add :LinkAdaptiveBitrateAAC:thresholds string 5,10,20,30' "$PLIST"
+          sudo /usr/libexec/PlistBuddy -c 'Add :LinkAdaptiveBitrateAAC:rates string 96,128,160,192,256' "$PLIST"
+          date -u +%Y-%m-%dT%H:%M:%SZ > /tmp/start.txt
+          sudo notifyutil -p com.apple.bluetooth.prefsChanged || true
+          sleep 2
+          sudo launchctl kickstart -k system/com.apple.bluetoothd || sudo killall bluetoothd || true
+          sleep 5
+          /usr/bin/log show --last 20s --style compact --predicate 'process == "bluetoothd" AND (eventMessage CONTAINS[c] "Adaptive Encoder Bitrate" OR eventMessage CONTAINS[c] "AAC Link Adaptive" OR eventMessage CONTAINS[c] "AAC-LC bitrate" OR eventMessage CONTAINS[c] "AACBitrate")' > /tmp/bt.log || true
+          cat /tmp/bt.log
+          sudo /usr/libexec/PlistBuddy -c 'Print :A2DP:AACBitrate' "$PLIST"
+          sudo /usr/libexec/PlistBuddy -c 'Print :Audio:DisableAdaptiveEncoderBitrate' "$PLIST"
+          sudo /usr/libexec/PlistBuddy -c 'Print :LinkAdaptiveBitrateAAC' "$PLIST"
