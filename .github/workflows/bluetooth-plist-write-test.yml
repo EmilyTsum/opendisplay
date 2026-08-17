@@ -1,0 +1,48 @@
+name: Bluetooth Plist Write Test
+on:
+  push:
+    branches: [research/bluetooth-aac-128k]
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify nested Bluetooth preference backend
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PLIST=/Library/Preferences/com.apple.Bluetooth.plist
+          sudo cp "$PLIST" /tmp/com.apple.Bluetooth.before.plist 2>/dev/null || true
+          sudo /usr/libexec/PlistBuddy -c 'Add :A2DP dict' "$PLIST" 2>/dev/null || true
+          sudo /usr/libexec/PlistBuddy -c 'Delete :A2DP:AACBitrate' "$PLIST" 2>/dev/null || true
+          sudo /usr/libexec/PlistBuddy -c 'Add :A2DP:AACBitrate integer 256' "$PLIST"
+          sudo /usr/libexec/PlistBuddy -c 'Add :LinkAdaptiveBitrateAAC dict' "$PLIST" 2>/dev/null || true
+          sudo /usr/libexec/PlistBuddy -c 'Delete :LinkAdaptiveBitrateAAC:configs' "$PLIST" 2>/dev/null || true
+          sudo /usr/libexec/PlistBuddy -c 'Add :LinkAdaptiveBitrateAAC:configs integer 2' "$PLIST"
+          sudo /usr/libexec/PlistBuddy -c 'Delete :LinkAdaptiveBitrateAAC:bitrateCount' "$PLIST" 2>/dev/null || true
+          sudo /usr/libexec/PlistBuddy -c 'Add :LinkAdaptiveBitrateAAC:bitrateCount integer 5' "$PLIST"
+          sudo /usr/libexec/PlistBuddy -c 'Delete :LinkAdaptiveBitrateAAC:thresholds' "$PLIST" 2>/dev/null || true
+          sudo /usr/libexec/PlistBuddy -c 'Add :LinkAdaptiveBitrateAAC:thresholds string 5,10,20,30' "$PLIST"
+          sudo /usr/libexec/PlistBuddy -c 'Delete :LinkAdaptiveBitrateAAC:rates' "$PLIST" 2>/dev/null || true
+          sudo /usr/libexec/PlistBuddy -c 'Add :LinkAdaptiveBitrateAAC:rates string 96,128,160,192,256' "$PLIST"
+          notifyutil -p com.apple.bluetooth.prefsChanged || true
+          cat > /tmp/read.m <<'SRC'
+          #import <Foundation/Foundation.h>
+          #import <objc/message.h>
+          #import <dlfcn.h>
+          static id get(NSString *section, NSString *key){
+            Class c=NSClassFromString(@"CBUtil"); SEL s=NSSelectorFromString(@"getBluetoothDebugSettingString:InKey:");
+            id (*g)(id,SEL,CFStringRef,CFStringRef)=(void*)objc_msgSend;
+            return g((id)c,s,(__bridge CFStringRef)section,(__bridge CFStringRef)key);
+          }
+          int main(){@autoreleasepool{
+            dlopen("/System/Library/PrivateFrameworks/BluetoothAudio.framework/BluetoothAudio",RTLD_NOW);
+            NSLog(@"A2DP/AACBitrate=%@",get(@"A2DP",@"AACBitrate"));
+            for(NSString *k in @[@"configs",@"bitrateCount",@"thresholds",@"rates"]) NSLog(@"LinkAdaptiveBitrateAAC/%@=%@",k,get(@"LinkAdaptiveBitrateAAC",k));
+          }return 0;}
+          SRC
+          clang -fobjc-arc -framework Foundation /tmp/read.m -o /tmp/read
+          /tmp/read
+          sudo /usr/libexec/PlistBuddy -c 'Print :A2DP:AACBitrate' "$PLIST"
+          sudo /usr/libexec/PlistBuddy -c 'Print :LinkAdaptiveBitrateAAC' "$PLIST"
