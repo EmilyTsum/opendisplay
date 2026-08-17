@@ -229,6 +229,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var usbLinkProbeGeneration = 0
     private var usbLinkProbeComplete = false
     private var connectedUSBUDID: String?
+    private var connectedUSBLocationID: Int?
     // Stable per-device serial for the virtual display, so macOS can tell
     // multiple OpenDisplay monitors apart and persist their arrangement.
     private var displaySerial: UInt32
@@ -288,6 +289,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private let audioQueue = DispatchQueue(label: "sender.audio", qos: .userInteractive)
     private var audioPacketsSent = 0
     private var audioBytesSent = 0
+    private var pendingAudioSends = 0
+    private let maxPendingAudioSends = 4
+    private var audioPacketsDropped = 0
     private let pipelineLock = NSLock()
     private var dropsEncThisWindow = 0
     private var dropsNetThisWindow = 0
@@ -439,6 +443,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
         switch mode {
         case .mirror:
+            // Mirror used to start capture immediately with the sender's
+            // default H.264/60Hz/audio-off state, so Codec/Refresh/Audio
+            // preferences were silently ignored. Resolve the same receiver
+            // capabilities as Extend before constructing the capture pipeline.
+            let info = try await waitForHello()
+            activeFrameRate = refreshRatePreference.resolved(deviceMaximum: info.maximumFrameRate)
+            activeCodec = codecPreference.resolved(
+                peerSupportsHEVC: info.supportsHEVC,
+                peerSupportsProResLT: info.supportsProResLT,
+                peerSupportsProResProxy: info.supportsProResProxy)
+            activeAudio = audioEnabled && info.supportsPCM48kStereo
             let content = try await SCShareableContent.current
             guard let display = content.displays.first else {
                 throw NSError(domain: "MacSender", code: 1,
@@ -781,6 +796,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         connection = nil
         pendingSends = 0
         pendingProResFrame = nil
+        pendingAudioSends = 0
+        connectedUSBUDID = nil
+        connectedUSBLocationID = nil
+        usbLinkInfo = nil
         if let encoder { VTCompressionSessionInvalidate(encoder) }
         encoder = nil
         virtualDisplay = nil   // releasing it removes the display
@@ -808,6 +827,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.usbLinkProbeGeneration += 1
             self.usbLinkInfo = nil
             self.connectedUSBUDID = nil
+            self.connectedUSBLocationID = nil
             // Fresh grace window: if the new link can't come up either, the
             // session ends like any other disconnect instead of dialing
             // a dead transport forever.
@@ -818,6 +838,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.connection = nil
             self.pendingSends = 0
             self.pendingProResFrame = nil
+            self.pendingAudioSends = 0
             self.pipelineLock.lock()
             self.pendingEncodes = 0
             self.pipelineLock.unlock()
@@ -985,8 +1006,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             usbLinkProbeComplete = true
             return
         }
+        let locationID = connectedUSBLocationID
         Task { [weak self] in
-            let info = await USBLinkInfo.detect(udid: udid)
+            let info = await USBLinkInfo.detect(udid: udid, locationID: locationID)
             self?.queue.async { [weak self] in
                 guard let self,
                       probeGeneration == self.usbLinkProbeGeneration,
@@ -997,7 +1019,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 if let info {
                     Log.info("physical USB link: \(info.hudLabel) (device \(udid.prefix(8))…)")
                 } else {
-                    Log.info("physical USB link speed unavailable for device \(udid.prefix(8))…")
+                    let location = locationID.map { String(format: "0x%08X", UInt32(truncatingIfNeeded: $0)) }
+                        ?? "unknown"
+                    Log.info("physical USB link speed unavailable for device \(udid.prefix(8))… location=\(location)")
                 }
             }
         }
@@ -1005,6 +1029,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func connectTCP(_ endpoint: NWEndpoint) {
         connectedUSBUDID = nil
+        connectedUSBLocationID = nil
         usbLinkInfo = nil
         usbLinkProbeComplete = false
         let options = NWProtocolTCP.Options()
@@ -1074,6 +1099,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                         return
                     }
                     self.connectedUSBUDID = device.udid
+                    self.connectedUSBLocationID = device.locationID
                     self.connection = conn
                     conn.stateUpdateHandler = { [weak self] state in
                         guard let self else { return }
@@ -1135,6 +1161,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         connection = nil
         pendingSends = 0
         pendingProResFrame = nil
+        pendingAudioSends = 0
         pipelineLock.lock()
         pendingEncodes = 0
         pipelineLock.unlock()
@@ -1197,7 +1224,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 } else {
                     usbLink = ""
                 }
-                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps),\"encFps\":\(encFps),\"encMs50\":\(enc50),\"encMs95\":\(enc95),\"encInFlight\":\(encodeInflightNow),\"encPeak\":\(encodeInflightPeak),\"encLimit\":\(self.maxPendingEncodes),\"wireMs50\":\(wire50),\"wireMs95\":\(wire95),\"frameKB\":\(frameKB),\"usbMbps\":\(usbMbps),\"usbLink\":\"\(usbLink)\"}")
+                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps),\"encFps\":\(encFps),\"encMs50\":\(enc50),\"encMs95\":\(enc95),\"encInFlight\":\(encodeInflightNow),\"encPeak\":\(encodeInflightPeak),\"encLimit\":\(self.maxPendingEncodes),\"wireMs50\":\(wire50),\"wireMs95\":\(wire95),\"frameKB\":\(frameKB),\"usbMbps\":\(usbMbps),\"usbLink\":\"\(usbLink)\",\"audioTxDrops\":\(self.audioPacketsDropped)}")
             }
             self.schedulePing()
         }
@@ -1677,16 +1704,25 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.async { [weak self] in
             guard let self, self.activeAudio, self.connectionReady,
                   let connection = self.connection else { return }
+            guard self.pendingAudioSends < self.maxPendingAudioSends else {
+                self.audioPacketsDropped += 1
+                return
+            }
             var length = UInt32(payload.count).bigEndian
             var frame = Data(bytes: &length, count: 4)
             frame.append(payload)
+            self.pendingAudioSends += 1
             connection.send(content: frame, completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
-                if let error {
-                    Log.info("audio send error: \(error)")
-                } else {
-                    self.audioPacketsSent += 1
-                    self.audioBytesSent += frame.count
+                self.queue.async {
+                    guard self.connection === connection else { return }
+                    self.pendingAudioSends = max(0, self.pendingAudioSends - 1)
+                    if let error {
+                        Log.info("audio send error: \(error)")
+                    } else {
+                        self.audioPacketsSent += 1
+                        self.audioBytesSent += frame.count
+                    }
                 }
             })
         }

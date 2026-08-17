@@ -127,6 +127,7 @@ final class PhoneReceiver: ObservableObject {
     private var macWireSendP50 = 0.0
     private var macWireSendP95 = 0.0
     private var macWireFrameKB = 0.0
+    private var macAudioDrops = 0
 
     // Low-latency system-audio playback. Video and audio share the outer TCP
     // framing, but audio has its own AVAudioEngine queue and never contributes
@@ -494,6 +495,7 @@ final class PhoneReceiver: ObservableObject {
             macWireSendP50 = obj["wireMs50"] as? Double ?? macWireSendP50
             macWireSendP95 = obj["wireMs95"] as? Double ?? macWireSendP95
             macWireFrameKB = obj["frameKB"] as? Double ?? macWireFrameKB
+            macAudioDrops = obj["audioTxDrops"] as? Int ?? macAudioDrops
         case "cursor":
             let visible = (obj["v"] as? Int ?? 0) == 1
             let x = obj["x"] as? Double ?? 0
@@ -1175,7 +1177,7 @@ final class PhoneReceiver: ObservableObject {
             stats.usbLink = macUSBLink
             stats.usbMbps = macUSBMbps
             stats.audioFormat = audioFormatLabel
-            stats.audioDrops = audioDrops
+            stats.audioDrops = audioDrops + macAudioDrops
             stats.wireSendP50 = macWireSendP50
             stats.wireSendP95 = macWireSendP95
             stats.wireFrameKB = macWireFrameKB

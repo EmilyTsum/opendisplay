@@ -51,4 +51,36 @@ final class USBLinkInfoTests: XCTestCase {
         XCTAssertEqual(info?.megabitsPerSecond, 5_000)
         XCTAssertEqual(info?.hudLabel, "USB · 5 Gb/s")
     }
+
+    func testFallsBackToJSONLocationIDWhenSerialDoesNotMatch() {
+        let profile: [String: Any] = [
+            "SPUSBDataType": [[
+                "_items": [[
+                    "_name": "iPad",
+                    "serial_num": "different-serial-representation",
+                    "location_id": "0x00100000 / 1",
+                    "speed": "Up to 10 Gb/s",
+                ]],
+            ]],
+        ]
+        let info = USBLinkInfo.parse(profile: profile,
+                                     udid: "00008110-001234567890001E",
+                                     locationID: 0x00100000)
+        XCTAssertEqual(info?.megabitsPerSecond, 10_000)
+    }
+
+    func testFallsBackToTextLocationIDWhenSerialIsMissing() {
+        let text = """
+            USB 3.1 Bus:
+
+              iPad:
+                Product ID: 0x12ab
+                Location ID: 0x00100000 / 1
+                Speed: Up to 5 Gb/s
+        """
+        let info = USBLinkInfo.parseText(profile: text,
+                                         udid: "not-present-in-profiler",
+                                         locationID: 0x00100000)
+        XCTAssertEqual(info?.megabitsPerSecond, 5_000)
+    }
 }

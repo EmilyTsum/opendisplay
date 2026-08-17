@@ -18,6 +18,7 @@ import Network
 struct UsbmuxDevice: Hashable, Identifiable {
     let deviceID: Int     // usbmuxd's handle — changes on every replug
     let udid: String      // stable hardware identifier
+    let locationID: Int?  // USB topology location; useful when macOS hides the UDID in SPUSBDataType
     var name: String?     // lockdown DeviceName ("Philip's iPhone"), best-effort
 
     var id: String { udid }
@@ -130,7 +131,16 @@ enum Usbmux {
         guard props["ConnectionType"] as? String == "USB",
               let deviceID = props["DeviceID"] as? Int,
               let udid = props["SerialNumber"] as? String else { return nil }
-        return UsbmuxDevice(deviceID: deviceID, udid: udid, name: nil)
+        let locationID: Int?
+        if let value = props["LocationID"] as? Int {
+            locationID = value
+        } else if let number = props["LocationID"] as? NSNumber {
+            locationID = number.intValue
+        } else {
+            locationID = nil
+        }
+        return UsbmuxDevice(deviceID: deviceID, udid: udid,
+                            locationID: locationID, name: nil)
     }
 
     // MARK: - Socket plumbing
