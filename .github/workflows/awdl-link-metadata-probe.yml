@@ -37,5 +37,11 @@ jobs:
           done
           echo '== ioreg wifi keys =='
           ioreg -l -w0 | grep -Ei 'awdl|channel|bandwidth|frequency|phy.*rate|link.*rate|mcs|rssi' | head -1000
+          echo '== exported Apple80211/WiFiP2P symbols =='
+          for f in /System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Apple80211 /System/Library/PrivateFrameworks/WiFiPeerToPeer.framework/Versions/Current/WiFiPeerToPeer; do
+            test -f "$f" || continue
+            echo "--- NM $f"
+            nm -gU "$f" 2>/dev/null | grep -Ei '80211|awdl|peer|channel|rate|rssi' | head -500 || true
+          done
           echo '== system profiler wifi =='
           system_profiler SPAirPortDataType -detailLevel full | head -1000
