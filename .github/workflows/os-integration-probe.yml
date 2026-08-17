@@ -44,6 +44,54 @@ jobs:
           # Inventory related frameworks, daemons, launchd units, plug-ins.
           find /System/Library -maxdepth 5 \( -iname '*sidecar*' -o -iname '*airplay*' -o -iname '*screenmirr*' -o -iname '*continuity*display*' \) -print > "$OUT/inventory.txt" 2>/dev/null || true
           launchctl print system 2>/dev/null | grep -Eai -C2 'sidecar|airplay|mirroring' > "$OUT/launchd.txt" || true
+      - name: Runtime enumerate Sidecar and AirPlay classes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/os-probe/runtime"
+          mkdir -p "$OUT"
+          cat > "$RUNNER_TEMP/probe.m" <<'SRC'
+          #import <Foundation/Foundation.h>
+          #import <objc/runtime.h>
+          #import <dlfcn.h>
+          static BOOL interesting(const char *s) {
+            if (!s) return NO;
+            NSString *x=[NSString stringWithUTF8String:s].lowercaseString;
+            return [x containsString:@"sidecar"] || [x containsString:@"airplay"] ||
+                   [x containsString:@"screenmirr"] || [x containsString:@"displaymanager"] ||
+                   [x containsString:@"outputdevice"] || [x containsString:@"continuity"];
+          }
+          int main(void) { @autoreleasepool {
+            NSArray *paths=@[
+              @"/System/Library/PrivateFrameworks/SidecarCore.framework/SidecarCore",
+              @"/System/Library/PrivateFrameworks/SidecarUI.framework/SidecarUI",
+              @"/System/Library/PrivateFrameworks/AirPlaySupport.framework/AirPlaySupport",
+              @"/System/Library/PrivateFrameworks/AirPlaySender.framework/AirPlaySender",
+              @"/System/Library/PrivateFrameworks/AirPlaySenderKit.framework/AirPlaySenderKit"
+            ];
+            for (NSString *p in paths) {
+              void *h=dlopen(p.UTF8String, RTLD_LAZY|RTLD_LOCAL);
+              printf("DLOPEN\t%s\t%s\n", p.UTF8String, h?"OK":(dlerror()?:"ERR"));
+            }
+            int count=objc_getClassList(NULL,0);
+            Class *classes=calloc(count,sizeof(Class));
+            objc_getClassList(classes,count);
+            for(int i=0;i<count;i++) {
+              Class c=classes[i]; const char *cn=class_getName(c);
+              if(!interesting(cn)) continue;
+              printf("CLASS\t%s\n",cn);
+              unsigned int mc=0; Method *ms=class_copyMethodList(c,&mc);
+              for(unsigned int j=0;j<mc;j++) printf("  -[%s %s]\n",cn,sel_getName(method_getName(ms[j])));
+              free(ms);
+              Class meta=object_getClass(c); mc=0; ms=class_copyMethodList(meta,&mc);
+              for(unsigned int j=0;j<mc;j++) printf("  +[%s %s]\n",cn,sel_getName(method_getName(ms[j])));
+              free(ms);
+            }
+            free(classes);
+          } return 0; }
+          SRC
+          clang -fobjc-arc -framework Foundation "$RUNNER_TEMP/probe.m" -o "$RUNNER_TEMP/probe"
+          "$RUNNER_TEMP/probe" > "$OUT/classes-methods.txt" 2>&1 || true
       - uses: actions/upload-artifact@v4
         with:
           name: os-integration-probe
