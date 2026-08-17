@@ -259,17 +259,38 @@ final class SenderController: ObservableObject {
 
     private func startBrowsing() {
         // TXT records carry the receiver's install id (new receivers).
-        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_opensidecar._tcp", domain: nil), using: .tcp)
+        let params = NWParameters.tcp
+        // Public Network.framework opt-in for Apple peer-to-peer Wi-Fi
+        // (AWDL). The same Bonjour service can still be discovered through the
+        // infrastructure WLAN, so this is additive and retains normal Wi-Fi as
+        // the fallback when no direct interface is available.
+        params.includePeerToPeer = true
+        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_opensidecar._tcp", domain: nil),
+                                using: params)
         browser.browseResultsChangedHandler = { [weak self] results, _ in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.discovered = Array(results)
+                for result in results {
+                    let names = result.interfaces.map(\.name).joined(separator: ",")
+                    if !names.isEmpty {
+                        Log.info("Bonjour \(self.serviceName(of: result) ?? "device") interfaces=\(names)")
+                    }
+                }
                 self.endSessionsWhoseServiceVanished()
                 self.autoConnect()
             }
         }
         browser.start(queue: .main)
         self.browser = browser
+    }
+
+    /// AWDL is intentionally selected by the interface on which Bonjour found
+    /// the service, rather than by constructing/link-local-address parsing.
+    /// `NWInterface.name` is public API and Network.framework carries the
+    /// Bonjour endpoint/interface association for us.
+    private func peerToPeerInterface(for result: NWBrowser.Result) -> NWInterface? {
+        result.interfaces.first { $0.name.lowercased().hasPrefix("awdl") }
     }
 
     // MARK: - Physical-device identity
@@ -387,7 +408,9 @@ final class SenderController: ObservableObject {
             Log.info("cable detached for \(session.id) — failing over to WiFi")
             session.onUSB = false
             session.wifiServiceName = serviceName(of: result)
-            session.sender.switchTransport(to: .tcp(result.endpoint))
+            session.sender.switchTransport(to: .tcp(
+                result.endpoint,
+                requiredInterface: peerToPeerInterface(for: result)))
         }
     }
 
@@ -512,12 +535,14 @@ final class SenderController: ObservableObject {
             if UserDefaults.standard.object(forKey: "host") != nil, udid == nil {
                 // Manual override: dial a plain TCP endpoint instead of usbmuxd.
                 transport = .tcp(.hostPort(host: NWEndpoint.Host(host),
-                                           port: NWEndpoint.Port(rawValue: portNum)!))
+                                           port: NWEndpoint.Port(rawValue: portNum)!),
+                                 requiredInterface: nil)
             } else {
                 transport = .usb(udid: udid, port: portNum)
             }
         case .wifi(let result):
-            transport = .tcp(result.endpoint)
+            transport = .tcp(result.endpoint,
+                             requiredInterface: peerToPeerInterface(for: result))
         }
 
         let name = label(for: target)
