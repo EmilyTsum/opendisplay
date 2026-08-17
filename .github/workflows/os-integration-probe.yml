@@ -211,6 +211,22 @@ jobs:
           clang -fobjc-arc -framework Foundation -framework CoreFoundation \
             tools/os-integration-research/sidecar-intent-probe.m \
             -o "$RUNNER_TEMP/sidecar-intent-probe"
+      - name: Probe Control Center Swift metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/os-probe/controlcenter-metadata"
+          mkdir -p "$OUT"
+          BIN=/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+          nm -a "$BIN" 2>&1 | grep -Eai 'Sidecar|ScreenMirroring|AirPlay|toggle' > "$OUT/nm-all-filtered.txt" || true
+          nm -m "$BIN" 2>&1 | grep -Eai 'Sidecar|ScreenMirroring|AirPlay|toggle' > "$OUT/nm-m-filtered.txt" || true
+          xcrun --find swift-reflection-dump > "$OUT/swift-reflection-path.txt" 2>&1 || true
+          if xcrun --find swift-reflection-dump >/dev/null 2>&1; then
+            xcrun swift-reflection-dump --help > "$OUT/swift-reflection-help.txt" 2>&1 || true
+            xcrun swift-reflection-dump --binary-filename "$BIN" > "$OUT/swift-reflection.txt" 2>&1 || true
+            grep -Eai -C3 'Sidecar|ScreenMirroringDisplayDevice|ScreenMirroringController|AirPlayController' "$OUT/swift-reflection.txt" > "$OUT/swift-reflection-filtered.txt" || true
+          fi
+          xcrun --find swift-inspect > "$OUT/swift-inspect-path.txt" 2>&1 || true
       - uses: actions/upload-artifact@v4
         with:
           name: os-integration-probe
