@@ -64,17 +64,26 @@ static void printConfig(id cfg, const char *prefix) {
                           "rtcp","rtcpTimeoutInterval","displayID","showSideBar","showTouchBar",
                           "configureDisplayExclusiveMode","service"};
     for (size_t i=0; i<sizeof(keys)/sizeof(keys[0]); i++) {
+        SEL sel=sel_registerName(keys[i]);
+        if (![cfg respondsToSelector:sel]) { printf("%s%-30s <missing>\n",prefix,keys[i]); continue; }
         id v = call0(cfg, keys[i]);
         printf("%s%-30s %s\n", prefix, keys[i], desc(v).UTF8String);
     }
-    id codec = call0(cfg, "codec");
-    NSInteger cv = [codec integerValue];
-    printf("%s%-30s %s (%s)\n", prefix, "codec", desc(codec).UTF8String, codecName(cv));
-    printf("%s%-30s %ld\n", prefix, "transport", callLong0(cfg,"transport"));
-    CGSize size = ((CGSize(*)(id,SEL))objc_msgSend)(cfg,sel_registerName("size"));
-    double scale = ((double(*)(id,SEL))objc_msgSend)(cfg,sel_registerName("scale"));
-    printf("%s%-30s %.0fx%.0f\n", prefix, "size", size.width, size.height);
-    printf("%s%-30s %.3f\n", prefix, "scale", scale);
+    if ([cfg respondsToSelector:sel_registerName("codec")]) {
+        id codec = call0(cfg, "codec");
+        NSInteger cv = [codec integerValue];
+        printf("%s%-30s %s (%s)\n", prefix, "codec", desc(codec).UTF8String, codecName(cv));
+    } else printf("%s%-30s <missing>\n",prefix,"codec");
+    if ([cfg respondsToSelector:sel_registerName("transport")]) printf("%s%-30s %ld\n", prefix, "transport", callLong0(cfg,"transport"));
+    else printf("%s%-30s <missing>\n",prefix,"transport");
+    if ([cfg respondsToSelector:sel_registerName("size")]) {
+        CGSize size = ((CGSize(*)(id,SEL))objc_msgSend)(cfg,sel_registerName("size"));
+        printf("%s%-30s %.0fx%.0f\n", prefix, "size", size.width, size.height);
+    } else printf("%s%-30s <missing>\n",prefix,"size");
+    if ([cfg respondsToSelector:sel_registerName("scale")]) {
+        double scale = ((double(*)(id,SEL))objc_msgSend)(cfg,sel_registerName("scale"));
+        printf("%s%-30s %.3f\n", prefix, "scale", scale);
+    } else printf("%s%-30s <missing>\n",prefix,"scale");
 }
 
 static NSArray *allDevices(id mgr) {
