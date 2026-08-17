@@ -255,6 +255,44 @@ jobs:
           SRC
           clang -fobjc-arc -framework Foundation "$RUNNER_TEMP/sidecar_disconnect.m" -o "$RUNNER_TEMP/sidecar_disconnect"
           "$RUNNER_TEMP/sidecar_disconnect" > "$OUT/sidecar-disconnect.txt" 2>&1 || true
+      - name: Probe Sidecar display config types and defaults
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/os-probe/runtime"
+          cat > "$RUNNER_TEMP/sidecar_config.m" <<'SRC'
+          #import <Foundation/Foundation.h>
+          #import <objc/runtime.h>
+          #import <objc/message.h>
+          #import <dlfcn.h>
+          static id call0(id o,const char*s){return ((id(*)(id,SEL))objc_msgSend)(o,sel_registerName(s));}
+          static void printMethod(Class c,const char *selname,BOOL cls){
+            SEL s=sel_registerName(selname); Method m=cls?class_getClassMethod(c,s):class_getInstanceMethod(c,s);
+            printf("METHOD %c%s %s\n",cls?'+':'-',selname,m?method_getTypeEncoding(m):"<missing>");
+          }
+          int main(void){@autoreleasepool{
+            dlopen("/System/Library/PrivateFrameworks/SidecarCore.framework/SidecarCore",RTLD_LAZY|RTLD_LOCAL);
+            Class cc=NSClassFromString(@"SidecarDisplayConfig");
+            Class mc=NSClassFromString(@"SidecarDisplayManager");
+            Class dc=NSClassFromString(@"SidecarDevice");
+            const char *sels[]={"framerate","setFramerate:","codec","setCodec:","txMaxBitrate","setTxMaxBitrate:","txMinBitrate","setTxMinBitrate:","lowLatency","setLowLatency:","transport","setTransport:","keyFrameInterval","setKeyFrameInterval:","tilesPerFrame","setTilesPerFrame:","hdr","setHdr:","enableTimeSync","setEnableTimeSync:"};
+            for(size_t i=0;i<sizeof(sels)/sizeof(sels[0]);i++) printMethod(cc,sels[i],NO);
+            unsigned int pc=0; objc_property_t *props=class_copyPropertyList(cc,&pc);
+            for(unsigned int i=0;i<pc;i++) printf("PROPERTY %s attrs=%s\n",property_getName(props[i]),property_getAttributes(props[i]));
+            free(props);
+            unsigned int ic=0; Ivar *iv=class_copyIvarList(cc,&ic);
+            for(unsigned int i=0;i<ic;i++) printf("IVAR %s type=%s\n",ivar_getName(iv[i]),ivar_getTypeEncoding(iv[i]));
+            free(iv);
+            id cfg=call0(call0((id)cc,"alloc"),"init");
+            printf("newConfig=%s\n",[[cfg description] UTF8String]);
+            id dev=((id(*)(id,SEL,id,id,id))objc_msgSend)(call0((id)dc,"alloc"),sel_registerName("initWithIdentifier:model:name:"),[NSUUID UUID],@"iPad13,8",@"OpenDisplay Fake Probe");
+            id mgr=call0((id)mc,"sharedManager");
+            @try { id existing=((id(*)(id,SEL,id))objc_msgSend)(mgr,sel_registerName("configForDevice:"),dev); printf("configForFake=%s\n",existing?[[existing description] UTF8String]:"nil"); }
+            @catch(NSException *e){printf("configForFake EXCEPTION %s\n",e.reason.UTF8String);}
+          }return 0;}
+          SRC
+          clang -fobjc-arc -framework Foundation "$RUNNER_TEMP/sidecar_config.m" -o "$RUNNER_TEMP/sidecar_config"
+          "$RUNNER_TEMP/sidecar_config" > "$OUT/sidecar-config.txt" 2>&1 || true
       - uses: actions/upload-artifact@v4
         with:
           name: os-integration-probe
