@@ -19,7 +19,8 @@ int main(void) { @autoreleasepool {
     Class ch = NSClassFromString(@"CWFChannel");
     printf("CWFChannel=%s\n", ch ? "yes" : "no");
     if (ch) {
-        for (unsigned band=0; band<=4; band++) for (int width=0; width<=6; width++) {
+        int widths[]={0,1,2,3,4,20,40,80,160,320};
+        for (unsigned band=0; band<=4; band++) for (size_t wi=0; wi<sizeof(widths)/sizeof(widths[0]); wi++) { int width=widths[wi];
             id x = ((id(*)(id,SEL,unsigned long long,unsigned,int))objc_msgSend)((id)ch, sel_registerName("channelWithNumber:band:width:"), 5, band, width);
             if (x) printf("CH band=%u width=%d => getters band=%u ch=%llu width=%d desc=%s\n", band,width,callU32(x,"band"),callU64(x,"channel"),callInt(x,"width"),[[x description] UTF8String]);
         }
