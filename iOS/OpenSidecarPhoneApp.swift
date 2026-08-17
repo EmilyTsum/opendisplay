@@ -409,9 +409,26 @@ struct PerfOverlay: View {
                 }
                 if !stats.audioFormat.isEmpty {
                     metric("audio", stats.audioFormat)
-                    if stats.audioDrops > 0 {
-                        metric("audio↓", "\(stats.audioDrops)")
+                    if !stats.audioLane.isEmpty { metric("audio lane", stats.audioLane) }
+                    if stats.audioCaptureBufferMs > 0 {
+                        metric("A cap", String(format: "%.1f ms", stats.audioCaptureBufferMs))
                     }
+                    if stats.audioSendP50 > 0 {
+                        metric("A tx", String(format: "%.1f/%.1f ms", stats.audioSendP50, stats.audioSendP95))
+                    }
+                    if stats.audioArrivalAgeMs > 0 {
+                        metric("A age", String(format: "%.1f ms", stats.audioArrivalAgeMs))
+                    }
+                    metric("A queue", String(format: "%.1f ms", stats.audioQueueMs))
+                    if stats.audioIOBufferMs > 0 {
+                        metric("A I/O", String(format: "%.1f ms", stats.audioIOBufferMs))
+                    }
+                    if stats.audioOutputLatencyMs > 0 {
+                        metric("A out", String(format: "%.1f ms", stats.audioOutputLatencyMs))
+                    }
+                    if stats.audioDrops > 0 { metric("audio↓", "\(stats.audioDrops)") }
+                    if stats.audioResyncs > 0 { metric("A sync", "\(stats.audioResyncs)") }
+                    if stats.audioSequenceGaps > 0 { metric("A gap", "\(stats.audioSequenceGaps)") }
                 }
                 if panelFPS > 0 {
                     metric("panel Hz", "\(panelFPS)")

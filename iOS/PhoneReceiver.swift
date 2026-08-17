@@ -47,6 +47,16 @@ struct PerfStats: Equatable {
     var usbLink = ""             // physical USB enumeration speed from macOS
     var audioFormat = ""         // active low-latency audio wire/playback format
     var audioDrops = 0            // packets discarded to avoid audio queue latency
+    var audioLane = ""            // dedicated / inline from Mac telemetry
+    var audioCaptureBufferMs = 0.0
+    var audioSendP50 = 0.0
+    var audioSendP95 = 0.0
+    var audioArrivalAgeMs = 0.0
+    var audioQueueMs = 0.0
+    var audioIOBufferMs = 0.0
+    var audioOutputLatencyMs = 0.0
+    var audioResyncs = 0
+    var audioSequenceGaps = 0
     var usbMbps = 0              // 480 / 5000 / 10000 / ...; 0 when unknown/WiFi
     var wireSendP50 = 0.0        // ProRes Network.framework completion latency
     var wireSendP95 = 0.0
@@ -74,8 +84,11 @@ final class PhoneReceiver: ObservableObject {
     var macSupportsPencilWire: Bool { macProtocolVersion >= WireProtocol.pencilWireVersion }
 
     private var listener: NWListener?
+    private var audioListener: NWListener?
     private var listenerHealthy = false
+    private var audioListenerHealthy = false
     private var connection: NWConnection?
+    private var audioConnection: NWConnection?
     private let queue = DispatchQueue(label: "receiver.video")
     private var formatDesc: CMVideoFormatDescription?
     private var vps: Data?
@@ -88,6 +101,7 @@ final class PhoneReceiver: ObservableObject {
     // so the listener can accept a fresh one.
     private var lastDataReceived = Date()
     private var port: UInt16 = 9000
+    private var audioPort: UInt16 { port == UInt16.max ? port : port + 1 }
     private var monitorsStarted = false
 
     private var framesThisWindow = 0
@@ -128,17 +142,34 @@ final class PhoneReceiver: ObservableObject {
     private var macWireSendP95 = 0.0
     private var macWireFrameKB = 0.0
     private var macAudioDrops = 0
+    private var macAudioLane = ""
+    private var macAudioCaptureBufferMs = 0.0
+    private var macAudioSendP50 = 0.0
+    private var macAudioSendP95 = 0.0
 
-    // Low-latency system-audio playback. Video and audio share the outer TCP
-    // framing, but audio has its own AVAudioEngine queue and never contributes
-    // to the video backpressure counters.
+    // Ultra-low-latency system-audio playback. Protocol 6 moves PCM onto a
+    // dedicated TCP lane so large ProRes frames cannot head-of-line block it.
+    // The AVAudioPlayerNode queue is deliberately shallow; if it grows stale,
+    // discard old scheduled audio and jump to the newest packet instead of
+    // preserving lip-sync lag.
     private let audioEngine = AVAudioEngine()
     private let audioPlayer = AVAudioPlayerNode()
     private var audioPlaybackFormat: AVAudioFormat?
     private var audioConfigured = false
     private var audioQueuedBuffers = 0
+    private var audioQueuedFrames: Int = 0
+    private var audioPlaybackGeneration: UInt64 = 0
     private var audioDrops = 0
+    private var audioResyncs = 0
+    private var audioSequenceGaps = 0
+    private var lastAudioSequence: UInt32?
+    private var audioArrivalAgeMs = 0.0
+    private var audioQueueMs = 0.0
+    private var audioIOBufferMs = 0.0
+    private var audioOutputLatencyMs = 0.0
     private var audioFormatLabel = ""
+    private let maxAudioQueueMs = 15.0
+    private let maxAudioPacketAgeMs = 45.0
 
     private var nowMs: Double { Date().timeIntervalSince1970 * 1000 }
 
@@ -237,6 +268,14 @@ final class PhoneReceiver: ObservableObject {
                                   domain: nil, txtRecord: txt)
     }
 
+    private var advertisedAudioService: NWListener.Service {
+        var txt = NWTXTRecord()
+        txt["id"] = Self.installID
+        txt["pv"] = String(WireProtocol.version)
+        return NWListener.Service(name: serviceName, type: "_opensidecar-audio._tcp",
+                                  domain: nil, txtRecord: txt)
+    }
+
     /// Update the advertised name and re-publish if already listening.
     func setServiceName(_ name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -246,6 +285,7 @@ final class PhoneReceiver: ObservableObject {
             self.serviceName = resolved
             if self.listener != nil {
                 self.listener?.service = self.advertisedService
+                self.audioListener?.service = self.advertisedAudioService
                 Log.info("re-advertising as \"\(resolved)\"")
             }
         }
@@ -348,9 +388,14 @@ final class PhoneReceiver: ObservableObject {
                 finished = true
                 self.connection?.cancel()
                 self.connection = nil
+                self.audioConnection?.cancel()
+                self.audioConnection = nil
                 self.listener?.cancel()
                 self.listener = nil
+                self.audioListener?.cancel()
+                self.audioListener = nil
                 self.listenerHealthy = false
+                self.audioListenerHealthy = false
                 self.setConnected(false)
                 self.setStatus(status)
                 completion?()
@@ -373,8 +418,12 @@ final class PhoneReceiver: ObservableObject {
     private func restartListener() {
         listener?.cancel()
         listener = nil
+        audioListener?.cancel()
+        audioListener = nil
         listenerHealthy = false
+        audioListenerHealthy = false
         startListener()
+        startAudioListener()
     }
 
     private func startListener() {
@@ -408,8 +457,12 @@ final class PhoneReceiver: ObservableObject {
             let peer = String(describing: conn.endpoint)
             self.transport = (peer.hasPrefix("127.0.0.1") || peer.hasPrefix("::1")
                               || peer.hasPrefix("localhost")) ? "USB" : "WiFi"
-            // Replace any existing connection and reset decoder state.
+            // Replace any existing primary connection and its auxiliary PCM
+            // lane; the new Mac session will redial the audio service after
+            // receiving our protocol-6 hello.
             self.connection?.cancel()
+            self.audioConnection?.cancel()
+            self.audioConnection = nil
             self.connection = conn
             self.resetStreamState()
             conn.stateUpdateHandler = { [weak self] state in
@@ -443,6 +496,67 @@ final class PhoneReceiver: ObservableObject {
             }
         }
         listener?.start(queue: queue)
+    }
+
+    /// Protocol 6 auxiliary PCM listener. Keeping audio on a second TCP flow
+    /// avoids head-of-line blocking behind 0.5–1 MiB ProRes video frames while
+    /// preserving reliable, in-order delivery. The same service works over
+    /// infrastructure Wi-Fi and AWDL; usbmux dials `audioPort` directly.
+    private func startAudioListener() {
+        guard audioPort != port else {
+            Log.info("audio lane disabled: no adjacent TCP port available")
+            return
+        }
+        do {
+            let tcp = NWProtocolTCP.Options()
+            tcp.noDelay = true
+            let params = NWParameters(tls: nil, tcp: tcp)
+            params.allowLocalEndpointReuse = true
+            params.serviceClass = .responsiveData
+            params.includePeerToPeer = true
+            audioListener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: audioPort)!)
+        } catch {
+            Log.info("audio listener failed: \(error)")
+            return
+        }
+        audioListener?.service = advertisedAudioService
+        audioListener?.newConnectionHandler = { [weak self] conn in
+            guard let self else { return }
+            Log.info("new low-latency audio connection from \(String(describing: conn.endpoint))")
+            self.audioConnection?.cancel()
+            self.audioConnection = conn
+            conn.stateUpdateHandler = { [weak self, weak conn] state in
+                guard let self, let conn, self.audioConnection === conn else { return }
+                switch state {
+                case .ready:
+                    Log.info("low-latency audio lane ready")
+                    self.receiveAudioFrameHeader(on: conn)
+                case .failed(let error):
+                    Log.info("audio lane failed: \(error)")
+                    self.audioConnection = nil
+                case .cancelled:
+                    self.audioConnection = nil
+                default: break
+                }
+            }
+            conn.start(queue: self.queue)
+        }
+        audioListener?.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                self.audioListenerHealthy = true
+                Log.info("low-latency audio listener ready on :\(self.audioPort)")
+            case .failed(let error):
+                self.audioListenerHealthy = false
+                Log.info("audio listener failed: \(error) — restarting with main listener")
+                self.queue.asyncAfter(deadline: .now() + 1) { self.restartListener() }
+            case .cancelled:
+                self.audioListenerHealthy = false
+            default: break
+            }
+        }
+        audioListener?.start(queue: queue)
     }
 
     // MARK: - Liveness (ping + watchdog)
@@ -502,6 +616,10 @@ final class PhoneReceiver: ObservableObject {
             macWireSendP95 = obj["wireMs95"] as? Double ?? macWireSendP95
             macWireFrameKB = obj["frameKB"] as? Double ?? macWireFrameKB
             macAudioDrops = obj["audioTxDrops"] as? Int ?? macAudioDrops
+            macAudioLane = obj["audioLane"] as? String ?? macAudioLane
+            macAudioCaptureBufferMs = (obj["audioCapMs"] as? NSNumber)?.doubleValue ?? macAudioCaptureBufferMs
+            macAudioSendP50 = (obj["audioSend50"] as? NSNumber)?.doubleValue ?? macAudioSendP50
+            macAudioSendP95 = (obj["audioSend95"] as? NSNumber)?.doubleValue ?? macAudioSendP95
         case "cursor":
             let visible = (obj["v"] as? Int ?? 0) == 1
             let x = obj["x"] as? Double ?? 0
@@ -568,8 +686,13 @@ final class PhoneReceiver: ObservableObject {
         }
         decodeWindow.removeAll(keepingCapacity: true)
         photonWindow.removeAll(keepingCapacity: true)
+        audioPlaybackGeneration &+= 1
         audioPlayer.stop()
         audioQueuedBuffers = 0
+        audioQueuedFrames = 0
+        audioQueueMs = 0
+        lastAudioSequence = nil
+        audioArrivalAgeMs = 0
         audioFormatLabel = ""
     }
 
@@ -586,6 +709,7 @@ final class PhoneReceiver: ObservableObject {
             "maxFPS": UIScreen.main.maximumFramesPerSecond,
             "codecs": supportedCodecNames,
             "audioFormats": [StreamAudioFormat.pcmS16LE48kStereo.rawValue],
+            "audioPort": Int(audioPort),
             "id": Self.installID,
             "pv": WireProtocol.version,   // issue #132 — absent on old receivers
         ], on: conn)
@@ -710,6 +834,53 @@ final class PhoneReceiver: ObservableObject {
         }
     }
 
+    private func receiveAudioFrameHeader(on conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: 4, maximumLength: 4) {
+            [weak self] data, _, isComplete, error in
+            guard let self, self.audioConnection === conn else { return }
+            if let error {
+                Log.info("audio receive header error: \(error)")
+                self.audioConnection = nil
+                return
+            }
+            guard let data, data.count == 4 else {
+                if isComplete { self.audioConnection = nil }
+                return
+            }
+            let length = data.withUnsafeBytes {
+                Int(UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self)))
+            }
+            guard length >= 12, length <= 256 * 1024 else {
+                Log.info("invalid audio frame length: \(length)")
+                conn.cancel()
+                return
+            }
+            self.receiveAudioFramePayload(length: length, on: conn)
+        }
+    }
+
+    private func receiveAudioFramePayload(length: Int, on conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: length, maximumLength: length) {
+            [weak self] data, _, isComplete, error in
+            guard let self, self.audioConnection === conn else { return }
+            if let error {
+                Log.info("audio receive payload error: \(error)")
+                self.audioConnection = nil
+                return
+            }
+            guard let data, data.count == length else {
+                if isComplete { self.audioConnection = nil }
+                return
+            }
+            if data.prefix(4) == Data("ODA2".utf8) || data.prefix(4) == Data("ODAU".utf8) {
+                self.handleAudioFrame(data)
+            } else {
+                Log.info("unexpected payload on audio lane")
+            }
+            self.receiveAudioFrameHeader(on: conn)
+        }
+    }
+
     // MARK: - Annex B -> CMSampleBuffer
 
     private func handleAnnexB(_ data: Data) {
@@ -722,7 +893,8 @@ final class PhoneReceiver: ObservableObject {
             return
         }
 
-        if data.count >= 12, data.prefix(4) == Data("ODAU".utf8) {
+        if data.count >= 12,
+           data.prefix(4) == Data("ODAU".utf8) || data.prefix(4) == Data("ODA2".utf8) {
             handleAudioFrame(data)
             return
         }
@@ -825,8 +997,13 @@ final class PhoneReceiver: ObservableObject {
         enqueueFrame(vclNALUs, captureMs: captureMs, sendMs: sendMs)
     }
 
-    /// [ODAU][u32 sampleRate][u16 channels][u16 bits][S16LE interleaved PCM]
+    /// Legacy: [ODAU][u32 rate][u16 channels][u16 bits][PCM...]
+    /// Protocol 6: [ODA2][u32 rate][u16 channels][u16 bits][u32 sequence]
+    ///             [i64 captureWallMs][PCM...]
     private func handleAudioFrame(_ data: Data) {
+        let isV2 = data.count >= 24 && data.prefix(4) == Data("ODA2".utf8)
+        let headerBytes = isV2 ? 24 : 12
+        guard data.count >= headerBytes else { return }
         let sampleRate = data[4..<8].withUnsafeBytes {
             Int(UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self)))
         }
@@ -837,33 +1014,71 @@ final class PhoneReceiver: ObservableObject {
             Int(UInt16(bigEndian: $0.loadUnaligned(as: UInt16.self)))
         }
         guard sampleRate == 48_000, channels == 2, bits == 16 else { return }
-        let pcm = data.dropFirst(12)
-        guard !pcm.isEmpty, pcm.count % 4 == 0 else { return }
 
-        // Do not let a transient transport stall turn into seconds of audible
-        // lag. Eight normal SCK audio buffers are already ample jitter room.
-        guard audioQueuedBuffers < 8 else {
-            audioDrops += 1
-            return
+        if isV2 {
+            let sequence = data[12..<16].withUnsafeBytes {
+                UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self))
+            }
+            let captureMs = data[16..<24].withUnsafeBytes {
+                Int64(bigEndian: $0.loadUnaligned(as: Int64.self))
+            }
+            if let last = lastAudioSequence, sequence != last &+ 1 {
+                audioSequenceGaps += 1
+            }
+            lastAudioSequence = sequence
+            if captureMs > 0, let offset = clockOffsetMs {
+                let age = (nowMs + offset) - Double(captureMs)
+                audioArrivalAgeMs = max(0, age)
+                // If a transport hiccup delivered an old packet, do not let it
+                // rebuild latency. Fresh packets on the dedicated lane follow
+                // immediately and start playback from the current moment.
+                if age > maxAudioPacketAgeMs {
+                    audioDrops += 1
+                    return
+                }
+            }
         }
+
+        let pcm = data.dropFirst(headerBytes)
+        guard !pcm.isEmpty, pcm.count % 4 == 0 else { return }
         guard let format = ensureAudioPlayback(sampleRate: Double(sampleRate),
                                                channels: AVAudioChannelCount(channels)) else { return }
         let frames = AVAudioFrameCount(pcm.count / 4)
+        let framesInt = Int(frames)
+        let packetMs = Double(framesInt) * 1000.0 / Double(sampleRate)
+        let queuedMs = Double(audioQueuedFrames) * 1000.0 / Double(sampleRate)
+
+        // Freshness beats completeness for a remote display. If scheduled
+        // audio exceeds the shallow budget, flush old audio and immediately
+        // restart from this newest packet instead of accumulating A/V lag.
+        if queuedMs + packetMs > maxAudioQueueMs, audioQueuedFrames > 0 {
+            audioPlaybackGeneration &+= 1
+            audioPlayer.stop()
+            audioQueuedBuffers = 0
+            audioQueuedFrames = 0
+            audioQueueMs = 0
+            audioResyncs += 1
+        }
+
         guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return }
         buffer.frameLength = frames
         let audioBuffers = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
         guard let destination = audioBuffers.first?.mData else { return }
         pcm.withUnsafeBytes { raw in
-            if let source = raw.baseAddress {
-                memcpy(destination, source, pcm.count)
-            }
+            if let source = raw.baseAddress { memcpy(destination, source, pcm.count) }
         }
 
+        let generation = audioPlaybackGeneration
         audioQueuedBuffers += 1
-        audioFormatLabel = "PCM 48k/2ch"
+        audioQueuedFrames += framesInt
+        audioQueueMs = Double(audioQueuedFrames) * 1000.0 / Double(sampleRate)
+        audioFormatLabel = isV2 ? "PCM LL 48k/2ch" : "PCM 48k/2ch"
         audioPlayer.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             self?.queue.async {
-                self?.audioQueuedBuffers = max(0, (self?.audioQueuedBuffers ?? 1) - 1)
+                guard let self, generation == self.audioPlaybackGeneration else { return }
+                self.audioQueuedBuffers = max(0, self.audioQueuedBuffers - 1)
+                self.audioQueuedFrames = max(0, self.audioQueuedFrames - framesInt)
+                self.audioQueueMs = Double(self.audioQueuedFrames) * 1000.0 / Double(sampleRate)
             }
         }
         if !audioPlayer.isPlaying { audioPlayer.play() }
@@ -880,14 +1095,20 @@ final class PhoneReceiver: ObservableObject {
                 let session = AVAudioSession.sharedInstance()
                 try session.setCategory(.playback, mode: .default)
                 try session.setPreferredSampleRate(sampleRate)
-                try? session.setPreferredIOBufferDuration(0.005)
+                // 120 frames at 48 kHz = 2.5 ms. iOS treats this as a request;
+                // record the actual duration below so the HUD reports reality.
+                try? session.setPreferredIOBufferDuration(0.0025)
                 try session.setActive(true)
+                audioIOBufferMs = session.ioBufferDuration * 1000
+                audioOutputLatencyMs = session.outputLatency * 1000
                 audioEngine.attach(audioPlayer)
                 audioEngine.connect(audioPlayer, to: audioEngine.mainMixerNode, format: format)
+                audioEngine.prepare()
                 try audioEngine.start()
                 audioPlaybackFormat = format
                 audioConfigured = true
-                Log.info("audio playback ready: PCM S16LE 48kHz stereo")
+                Log.info(String(format: "audio playback ready: PCM S16LE 48kHz stereo io=%.2fms out=%.2fms",
+                                audioIOBufferMs, audioOutputLatencyMs))
             } catch {
                 Log.info("audio playback setup failed: \(error)")
                 return nil
@@ -1184,6 +1405,16 @@ final class PhoneReceiver: ObservableObject {
             stats.usbMbps = macUSBMbps
             stats.audioFormat = audioFormatLabel
             stats.audioDrops = audioDrops + macAudioDrops
+            stats.audioLane = macAudioLane
+            stats.audioCaptureBufferMs = macAudioCaptureBufferMs
+            stats.audioSendP50 = macAudioSendP50
+            stats.audioSendP95 = macAudioSendP95
+            stats.audioArrivalAgeMs = audioArrivalAgeMs
+            stats.audioQueueMs = audioQueueMs
+            stats.audioIOBufferMs = audioIOBufferMs
+            stats.audioOutputLatencyMs = audioOutputLatencyMs
+            stats.audioResyncs = audioResyncs
+            stats.audioSequenceGaps = audioSequenceGaps
             stats.wireSendP50 = macWireSendP50
             stats.wireSendP95 = macWireSendP95
             stats.wireFrameKB = macWireFrameKB
