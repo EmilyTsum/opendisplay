@@ -1,7 +1,6 @@
 name: Bluetooth AAC Probe
 on:
-  push:
-    branches: [research/bluetooth-aac-128k]
+  workflow_dispatch:
 jobs:
   probe:
     runs-on: macos-26
