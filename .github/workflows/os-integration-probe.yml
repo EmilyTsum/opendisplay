@@ -205,6 +205,12 @@ jobs:
           # Objective-C++ for the tiny range-for helper.
           clang++ -x objective-c++ -fobjc-arc -framework Foundation "$RUNNER_TEMP/sidecar_service.m" -o "$RUNNER_TEMP/sidecar_service"
           "$RUNNER_TEMP/sidecar_service" > "$OUT/sidecar-service.txt" 2>&1 || true
+      - name: Build passive Sidecar intent probe
+        shell: bash
+        run: |
+          clang -fobjc-arc -framework Foundation -framework CoreFoundation \
+            tools/os-integration-research/sidecar-intent-probe.m \
+            -o "$RUNNER_TEMP/sidecar-intent-probe"
       - uses: actions/upload-artifact@v4
         with:
           name: os-integration-probe
