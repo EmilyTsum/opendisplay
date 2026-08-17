@@ -270,7 +270,11 @@ final class SenderController: ObservableObject {
         browser.browseResultsChangedHandler = { [weak self] results, _ in
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.discovered = Array(results)
+                let rawResults = Array(results)
+                self.discovered = self.preferredBonjourResults(rawResults)
+                if self.discovered.count != rawResults.count {
+                    Log.info("coalesced \(rawResults.count) Bonjour routes into \(self.discovered.count) device identities")
+                }
                 for result in results {
                     let names = result.interfaces.map(\.name).joined(separator: ",")
                     if !names.isEmpty {
@@ -293,6 +297,35 @@ final class SenderController: ObservableObject {
         result.interfaces.first { $0.name.lowercased().hasPrefix("awdl") }
     }
 
+    /// Coalesce infrastructure Wi-Fi and AWDL observations of the same
+    /// Bonjour service into one physical-device row, preferring AWDL when it
+    /// is available.
+    private func preferredBonjourResults(_ results: [NWBrowser.Result]) -> [NWBrowser.Result] {
+        var selected: [String: NWBrowser.Result] = [:]
+        for result in results {
+            let key = PeerIdentity.bonjourRouteKey(
+                serviceName: serviceName(of: result),
+                installID: txtID(of: result),
+                fallback: String(describing: result.endpoint))
+            guard let current = selected[key] else {
+                selected[key] = result
+                continue
+            }
+            if PeerIdentity.shouldReplaceRoute(
+                currentHasPeerToPeer: peerToPeerInterface(for: current) != nil,
+                currentHasInstallID: txtID(of: current) != nil,
+                candidateHasPeerToPeer: peerToPeerInterface(for: result) != nil,
+                candidateHasInstallID: txtID(of: result) != nil) {
+                selected[key] = result
+            }
+        }
+        return selected.values.sorted {
+            (serviceName(of: $0) ?? String(describing: $0.endpoint))
+                .localizedCaseInsensitiveCompare(
+                    serviceName(of: $1) ?? String(describing: $1.endpoint)) == .orderedAscending
+        }
+    }
+
     // MARK: - Physical-device identity
 
     private func serviceName(of result: NWBrowser.Result) -> String? {
@@ -309,10 +342,11 @@ final class SenderController: ObservableObject {
     /// this USB device announced in a (past or present) hello. Fallback for
     /// old receivers: lockdown device name equals the service name.
     private func sameDevice(_ result: NWBrowser.Result, _ device: UsbmuxDevice) -> Bool {
-        if let id = txtID(of: result), installIDByUDID[device.udid] == id { return true }
-        if let name = serviceName(of: result), let usbName = device.name,
-           usbName == name { return true }
-        return false
+        PeerIdentity.matchesUSB(
+            bonjourInstallID: txtID(of: result),
+            serviceName: serviceName(of: result),
+            usbInstallID: installIDByUDID[device.udid],
+            usbName: device.name)
     }
 
     /// The session (over either transport) already serving this USB device.
@@ -320,9 +354,11 @@ final class SenderController: ObservableObject {
         if let direct = session(for: "usb:\(device.udid)") { return direct }
         return sessions.first { s in
             guard case .wifi(let result) = s.target else { return false }
-            if let id = installIDByUDID[device.udid],
-               s.deviceID == id || txtID(of: result) == id { return true }
-            return serviceName(of: result) != nil && device.name == serviceName(of: result)
+            return PeerIdentity.matchesUSB(
+                bonjourInstallID: s.deviceID ?? txtID(of: result),
+                serviceName: serviceName(of: result),
+                usbInstallID: installIDByUDID[device.udid],
+                usbName: device.name)
         }
     }
 
@@ -333,14 +369,19 @@ final class SenderController: ObservableObject {
         }
         return sessions.first { s in
             guard case .usb(let udid) = s.target else { return false }
-            if let id = txtID(of: result), s.deviceID == id { return true }
-            if let udid, let device = usbDevices.first(where: { $0.udid == udid }),
-               sameDevice(result, device) { return true }
-            // Browse results routinely lack their TXT record and the USB
-            // device is gone after a failover — the service name is then
-            // the only remaining link to the session.
-            let name = serviceName(of: result)
-            return name != nil && (name == s.wifiServiceName || name == s.name)
+            let usbInstallID = s.deviceID ?? udid.flatMap { installIDByUDID[$0] }
+            if let udid, let device = usbDevices.first(where: { $0.udid == udid }) {
+                return PeerIdentity.matchesUSB(
+                    bonjourInstallID: txtID(of: result),
+                    serviceName: serviceName(of: result),
+                    usbInstallID: usbInstallID,
+                    usbName: device.name)
+            }
+            return PeerIdentity.matchesUSB(
+                bonjourInstallID: txtID(of: result),
+                serviceName: serviceName(of: result),
+                usbInstallID: usbInstallID,
+                usbName: s.wifiServiceName ?? s.name)
         }
     }
 
