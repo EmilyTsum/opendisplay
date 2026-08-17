@@ -238,6 +238,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // observe through usbmux/TCP. Probed off-thread when a USB socket becomes
     // ready and surfaced to the receiver HUD for cable/link diagnosis.
     private var usbLinkInfo: USBLinkInfo?
+    // Read-only AWDL PHY diagnostics from CoreWiFi. Best effort only: private
+    // API drift or missing permissions must never affect the stream itself.
+    private var awdlLinkInfo: AWDLLinkInfo?
+    private var awdlLinkProbeGeneration = 0
+    private var awdlLinkProbeInFlight = false
     private var usbLinkProbeGeneration = 0
     private var usbLinkProbeComplete = false
     private var connectedUSBUDID: String?
@@ -823,6 +828,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         connectedUSBUDID = nil
         connectedUSBLocationID = nil
         usbLinkInfo = nil
+        awdlLinkProbeGeneration += 1
+        awdlLinkProbeInFlight = false
+        awdlLinkInfo = nil
         if let encoder { VTCompressionSessionInvalidate(encoder) }
         encoder = nil
         virtualDisplay = nil   // releasing it removes the display
@@ -855,6 +863,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.transport = newTransport
             self.usbLinkProbeGeneration += 1
             self.usbLinkInfo = nil
+            self.awdlLinkProbeGeneration += 1
+            self.awdlLinkProbeInFlight = false
+            self.awdlLinkInfo = nil
             self.connectedUSBUDID = nil
             self.connectedUSBLocationID = nil
             // Fresh grace window: if the new link can't come up either, the
@@ -1019,6 +1030,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         lastCursorSent = (-1, -1, false)
         lastReceived = Date()  // fresh grace period for the watchdog
         refreshUSBLinkInfo()
+        refreshAWDLLinkInfo()
         receiveControl(on: conn)
         Task { await self.status("Connected to \(self.endpointName)") }
     }
@@ -1052,6 +1064,38 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     let location = locationID.map { String(format: "0x%08X", UInt32(truncatingIfNeeded: $0)) }
                         ?? "unknown"
                     Log.info("physical USB link speed unavailable for device \(udid.prefix(8))… location=\(location)")
+                }
+            }
+        }
+    }
+
+    private func refreshAWDLLinkInfo() {
+        guard case .tcp(_, let requiredInterface) = transport,
+              let requiredInterface,
+              requiredInterface.name.lowercased().hasPrefix("awdl") else {
+            awdlLinkProbeGeneration += 1
+            awdlLinkProbeInFlight = false
+            awdlLinkInfo = nil
+            return
+        }
+        guard !awdlLinkProbeInFlight else { return }
+        awdlLinkProbeInFlight = true
+        awdlLinkProbeGeneration += 1
+        let generation = awdlLinkProbeGeneration
+        Task { [weak self] in
+            let info = await AWDLLinkInfo.detect()
+            self?.queue.async { [weak self] in
+                guard let self, generation == self.awdlLinkProbeGeneration,
+                      case .tcp(_, let currentInterface) = self.transport,
+                      currentInterface?.name.lowercased().hasPrefix("awdl") == true else { return }
+                self.awdlLinkProbeInFlight = false
+                self.awdlLinkInfo = info
+                if let info {
+                    let band = info.bandLabel ?? "?"
+                    let channel = info.channel.map(String.init) ?? "?"
+                    let width = info.bandwidthMHz.map { "\($0) MHz" } ?? "?"
+                    let tx = info.txRateMbps.map { String(format: "%.0f", $0) } ?? "?"
+                    Log.info("AWDL link: \(band) ch \(channel) \(width) tx=\(tx) Mb/s")
                 }
             }
         }
@@ -1353,6 +1397,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self, !self.stopped else { return }
             if self.connectionReady {
+                self.refreshAWDLLinkInfo()
                 // Liveness + send-side health for the phone's overlay.
                 let elapsed = Date().timeIntervalSince(self.capWindowStart)
                 let capFps = elapsed > 0 ? Int(Double(self.capFrames) / elapsed) : 0
@@ -1410,7 +1455,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     transportLabel = requiredInterface == nil ? "WiFi" : "AWDL"
                 }
                 let audioLane = self.audioConnectionReady ? "dedicated" : "inline"
-                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps),\"encFps\":\(encFps),\"encMs50\":\(enc50),\"encMs95\":\(enc95),\"encInFlight\":\(encodeInflightNow),\"encPeak\":\(encodeInflightPeak),\"encLimit\":\(self.maxPendingEncodes),\"wireMs50\":\(wire50),\"wireMs95\":\(wire95),\"frameKB\":\(frameKB),\"usbMbps\":\(usbMbps),\"usbLink\":\"\(usbLink)\",\"audioTxDrops\":\(self.audioPacketsDropped),\"audioLane\":\"\(audioLane)\",\"audioCapMs\":\(self.audioCaptureBufferMs),\"audioSend50\":\(audioSend50),\"audioSend95\":\(audioSend95),\"transport\":\"\(transportLabel)\"}")
+                let awdl = self.awdlLinkInfo
+                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps),\"encFps\":\(encFps),\"encMs50\":\(enc50),\"encMs95\":\(enc95),\"encInFlight\":\(encodeInflightNow),\"encPeak\":\(encodeInflightPeak),\"encLimit\":\(self.maxPendingEncodes),\"wireMs50\":\(wire50),\"wireMs95\":\(wire95),\"frameKB\":\(frameKB),\"usbMbps\":\(usbMbps),\"usbLink\":\"\(usbLink)\",\"audioTxDrops\":\(self.audioPacketsDropped),\"audioLane\":\"\(audioLane)\",\"audioCapMs\":\(self.audioCaptureBufferMs),\"audioSend50\":\(audioSend50),\"audioSend95\":\(audioSend95),\"awdlChannel\":\(awdl?.channel ?? 0),\"awdlBand\":\(awdl?.band ?? 0),\"awdlWidth\":\(awdl?.bandwidthMHz ?? 0),\"awdlFreq\":\(awdl?.frequencyMHz ?? 0),\"awdlTx\":\(awdl?.txRateMbps ?? 0),\"awdlRx\":\(awdl?.rxRateMbps ?? 0),\"awdlMax\":\(awdl?.maxLinkMbps ?? 0),\"awdlMCS\":\(awdl?.mcs ?? -1),\"awdlRSSI\":\(awdl?.rssi ?? 0),\"awdlPHY\":\(awdl?.phyMode ?? -1),\"transport\":\"\(transportLabel)\"}")
             }
             self.schedulePing()
         }

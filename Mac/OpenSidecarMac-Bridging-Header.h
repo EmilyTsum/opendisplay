@@ -1,4 +1,5 @@
 #import "CGVirtualDisplayPrivate.h"
+#import "AWDLLinkInfo.h"
 
 #include <sys/file.h>
 #include <sys/stat.h>

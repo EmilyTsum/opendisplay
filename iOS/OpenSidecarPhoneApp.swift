@@ -87,6 +87,7 @@ struct ReceiverScreen: View {
     @State private var nagDismissed = false
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("showAnalytics") private var showAnalytics = false
+    @AppStorage("showDetailedAnalytics") private var showDetailedAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
     // First-run onboarding (issue #49): explain the Mac app is required.
     // Shown until either the user dismisses it or the device connects once.
@@ -126,7 +127,8 @@ struct ReceiverScreen: View {
                             Spacer()
                             PerfOverlay(stats: model.receiver.perf,
                                         videoSize: model.receiver.videoSize,
-                                        panelFPS: displayRefresh.fps)
+                                        panelFPS: displayRefresh.fps,
+                                        detailed: showDetailedAnalytics)
                                 .padding(.bottom, 10)
                         }
                         .allowsHitTesting(false)   // never block touch input
@@ -363,23 +365,97 @@ struct PerfOverlay: View {
     let stats: PerfStats
     let videoSize: CGSize
     let panelFPS: Int
+    let detailed: Bool
+
+    private var awdlBandLabel: String? {
+        switch stats.awdlBand {
+        case 1: return "2.4 GHz"
+        case 2: return "5 GHz"
+        case 3: return "6 GHz"
+        default: return nil
+        }
+    }
+
+    private var awdlLinkSummary: String? {
+        guard stats.transport == "AWDL" else { return nil }
+        var parts: [String] = []
+        if let band = awdlBandLabel { parts.append(band) }
+        if stats.awdlChannel > 0 { parts.append("ch \(stats.awdlChannel)") }
+        if stats.awdlBandwidthMHz > 0 { parts.append("\(stats.awdlBandwidthMHz) MHz") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// Useful at a glance, but deliberately labelled as an estimate: arrival
+    /// age, queued PCM, I/O buffer and hardware output latency are measured at
+    /// slightly different points in the audio pipeline.
+    private var estimatedAudioMs: Double? {
+        guard !stats.audioFormat.isEmpty, stats.audioArrivalAgeMs > 0 else { return nil }
+        return stats.audioArrivalAgeMs + stats.audioQueueMs
+            + stats.audioIOBufferMs + stats.audioOutputLatencyMs
+    }
 
     var body: some View {
-        VStack(spacing: 8) {
-            // Metrics wrap onto extra rows when the width doesn't fit —
-            // portrait iPhone is ~390pt, far less than one full row.
-            FlowLayout(hSpacing: 14, vSpacing: 8) {
-                // Transport badge — the question "is this cable or WiFi?"
-                Text(stats.transport)
-                    .font(.system(size: 12, weight: .bold, design: .monospaced))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(stats.transport == "USB" ? Color.green.opacity(0.35)
-                                : stats.transport == "WiFi" ? Color.blue.opacity(0.4)
-                                : Color.gray.opacity(0.3),
-                                in: Capsule())
-                    .foregroundStyle(.white)
+        VStack(alignment: .leading, spacing: detailed ? 9 : 5) {
+            compactMetrics
+            if detailed {
+                detailedMetrics
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 14) { graphs }
+                    VStack(spacing: 8) { graphs }
+                }
+            }
+        }
+        .padding(.horizontal, detailed ? 16 : 12)
+        .padding(.vertical, detailed ? 9 : 7)
+        .background(.black.opacity(detailed ? 0.58 : 0.48), in: RoundedRectangle(cornerRadius: 12))
+        .padding(.horizontal, 8)
+    }
 
+    @ViewBuilder
+    private var compactMetrics: some View {
+        FlowLayout(hSpacing: 12, vSpacing: 6) {
+            transportBadge
+            if let awdlLinkSummary {
+                Text(awdlLinkSummary)
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.9))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(.white.opacity(0.10), in: Capsule())
+            }
+            if stats.e2eP50 > 0 {
+                metric("latency p50/p95", String(format: "%.0f / %.0f ms", stats.e2eP50, stats.e2eP95))
+            }
+            metric("Rx / panel", panelFPS > 0 ? "\(stats.fps) / \(panelFPS) Hz" : "\(stats.fps) fps")
+            metric("throughput", String(format: "%.0f Mb/s", stats.mbps))
+            if let audio = estimatedAudioMs {
+                metric("audio est.", String(format: "~%.1f ms", audio))
+            }
+        }
+    }
+
+    private var transportBadge: some View {
+        Text(stats.transport)
+            .font(.system(size: 12, weight: .bold, design: .monospaced))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(transportBadgeColor, in: Capsule())
+            .foregroundStyle(.white)
+    }
+
+    private var transportBadgeColor: Color {
+        switch stats.transport {
+        case "USB": return .green.opacity(0.35)
+        case "AWDL": return .purple.opacity(0.45)
+        case "WiFi": return .blue.opacity(0.4)
+        default: return .gray.opacity(0.3)
+        }
+    }
+
+    @ViewBuilder
+    private var detailedMetrics: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            diagnosticSection("Video") {
                 if stats.e2eP50 > 0 {
                     metric("latency", String(format: "%.0f ms", stats.e2eP50))
                     metric("p95", String(format: "%.0f ms", stats.e2eP95))
@@ -389,89 +465,78 @@ struct PerfOverlay: View {
                     metric("VT p50", String(format: "%.1f ms", stats.vtEncodeP50))
                     metric("VT p95", String(format: "%.1f ms", stats.vtEncodeP95))
                 }
-                if stats.decodeP50 > 0 {
-                    metric("decode", String(format: "%.1f ms", stats.decodeP50))
-                }
-                if stats.photonP50 > 0 {
-                    // True capture→glass latency (Metal presented handler) —
-                    // the only number that includes display vsync.
-                    metric("photon", String(format: "%.0f ms", stats.photonP50))
-                }
-                if stats.inputP50 > 0 {
-                    // touch→CGEvent on the Mac; full touch-to-photon adds
-                    // the render+capture wait and one e2e on top.
-                    metric("input", String(format: "%.0f ms", stats.inputP50))
-                }
-                metric("rtt", String(format: "%.0f ms", stats.rttMs))
+                if stats.decodeP50 > 0 { metric("decode", String(format: "%.1f ms", stats.decodeP50)) }
+                if stats.photonP50 > 0 { metric("photon", String(format: "%.0f ms", stats.photonP50)) }
+                if stats.inputP50 > 0 { metric("input", String(format: "%.0f ms", stats.inputP50)) }
                 metric("Rx FPS", "\(stats.fps)")
-                if stats.transport == "USB" {
-                    metric("USB link", stats.usbLink.isEmpty ? "Detecting…" : stats.usbLink)
-                }
-                if !stats.audioFormat.isEmpty {
-                    metric("audio", stats.audioFormat)
-                    if !stats.audioLane.isEmpty { metric("audio lane", stats.audioLane) }
-                    if stats.audioCaptureBufferMs > 0 {
-                        metric("A cap", String(format: "%.1f ms", stats.audioCaptureBufferMs))
-                    }
-                    if stats.audioSendP50 > 0 {
-                        metric("A tx", String(format: "%.1f/%.1f ms", stats.audioSendP50, stats.audioSendP95))
-                    }
-                    if stats.audioArrivalAgeMs > 0 {
-                        metric("A age", String(format: "%.1f ms", stats.audioArrivalAgeMs))
-                    }
-                    metric("A queue", String(format: "%.1f ms", stats.audioQueueMs))
-                    if stats.audioIOBufferMs > 0 {
-                        metric("A I/O", String(format: "%.1f ms", stats.audioIOBufferMs))
-                    }
-                    if stats.audioOutputLatencyMs > 0 {
-                        metric("A out", String(format: "%.1f ms", stats.audioOutputLatencyMs))
-                    }
-                    if stats.audioDrops > 0 { metric("audio↓", "\(stats.audioDrops)") }
-                    if stats.audioResyncs > 0 { metric("A sync", "\(stats.audioResyncs)") }
-                    if stats.audioSequenceGaps > 0 { metric("A gap", "\(stats.audioSequenceGaps)") }
-                }
-                if panelFPS > 0 {
-                    metric("panel Hz", "\(panelFPS)")
-                }
-                if stats.capFps > 0 {
-                    metric("Mac cap", "\(stats.capFps)")
-                }
-                if stats.encFps > 0 {
-                    metric("VT out", "\(stats.encFps)")
-                }
-                if stats.encLimit > 0 {
-                    metric("VT flight", "\(stats.encPeak)/\(stats.encLimit)")
-                }
+                if panelFPS > 0 { metric("panel Hz", "\(panelFPS)") }
+                if stats.capFps > 0 { metric("Mac cap", "\(stats.capFps)") }
+                if stats.encFps > 0 { metric("VT out", "\(stats.encFps)") }
+                if stats.encLimit > 0 { metric("VT flight", "\(stats.encPeak)/\(stats.encLimit)") }
                 if stats.wireSendP50 > 0 {
                     metric("wire p50", String(format: "%.1f ms", stats.wireSendP50))
                     metric("wire p95", String(format: "%.1f ms", stats.wireSendP95))
                 }
-                if stats.wireFrameKB > 0 {
-                    metric("KB/frame", String(format: "%.0f", stats.wireFrameKB))
+                if stats.wireFrameKB > 0 { metric("KB/frame", String(format: "%.0f", stats.wireFrameKB)) }
+                metric("res", "\(Int(videoSize.width))×\(Int(videoSize.height))")
+            }
+
+            diagnosticSection("Network") {
+                metric("RTT", String(format: "%.0f ms", stats.rttMs))
+                metric("throughput", String(format: "%.1f Mb/s", stats.mbps))
+                if stats.transport == "USB" {
+                    metric("USB link", stats.usbLink.isEmpty ? "Detecting…" : stats.usbLink)
                 }
-                metric("Mbit/s", String(format: "%.1f", stats.mbps))
+                if stats.transport == "AWDL" {
+                    if let band = awdlBandLabel { metric("band", band) }
+                    if stats.awdlChannel > 0 { metric("channel", "\(stats.awdlChannel)") }
+                    if stats.awdlBandwidthMHz > 0 { metric("width", "\(stats.awdlBandwidthMHz) MHz") }
+                    if stats.awdlFrequencyMHz > 0 { metric("frequency", "\(stats.awdlFrequencyMHz) MHz") }
+                    if stats.awdlTxRateMbps > 0 { metric("PHY Tx", String(format: "%.0f Mb/s", stats.awdlTxRateMbps)) }
+                    if stats.awdlRxRateMbps > 0 { metric("PHY Rx", String(format: "%.0f Mb/s", stats.awdlRxRateMbps)) }
+                    if stats.awdlMaxLinkMbps > 0 { metric("max link", String(format: "%.0f Mb/s", stats.awdlMaxLinkMbps)) }
+                    if stats.awdlRSSI != 0 { metric("RSSI", "\(stats.awdlRSSI) dBm") }
+                    if stats.awdlMCS >= 0 { metric("MCS", "\(stats.awdlMCS)") }
+                }
+            }
+
+            if !stats.audioFormat.isEmpty {
+                diagnosticSection("Audio") {
+                    metric("format", stats.audioFormat)
+                    if !stats.audioLane.isEmpty { metric("lane", stats.audioLane) }
+                    if stats.audioCaptureBufferMs > 0 { metric("capture", String(format: "%.1f ms", stats.audioCaptureBufferMs)) }
+                    if stats.audioSendP50 > 0 { metric("Tx p50/p95", String(format: "%.1f / %.1f ms", stats.audioSendP50, stats.audioSendP95)) }
+                    if stats.audioArrivalAgeMs > 0 { metric("arrival age", String(format: "%.1f ms", stats.audioArrivalAgeMs)) }
+                    metric("queue", String(format: "%.1f ms", stats.audioQueueMs))
+                    if stats.audioIOBufferMs > 0 { metric("I/O", String(format: "%.1f ms", stats.audioIOBufferMs)) }
+                    if stats.audioOutputLatencyMs > 0 { metric("output", String(format: "%.1f ms", stats.audioOutputLatencyMs)) }
+                    if let audio = estimatedAudioMs { metric("estimated", String(format: "~%.1f ms", audio)) }
+                    if stats.audioDrops > 0 { metric("drops", "\(stats.audioDrops)") }
+                    if stats.audioResyncs > 0 { metric("resync", "\(stats.audioResyncs)") }
+                    if stats.audioSequenceGaps > 0 { metric("gaps", "\(stats.audioSequenceGaps)") }
+                }
+            }
+
+            diagnosticSection("Reliability") {
                 metric("stalls", "\(stats.stalls)")
                 metric("enc↓", "\(stats.macEncDrops)")
                 metric("net↓", "\(stats.macNetDrops)")
-                if stats.macPending > 0 {
-                    metric("queue", "\(stats.macPending)")
-                }
-                if stats.decodeFlushes > 0 {
-                    metric("flushes", "\(stats.decodeFlushes)")
-                }
-                metric("res", "\(Int(videoSize.width))×\(Int(videoSize.height))")
-            }
-            // Two graphs side by side where they fit (landscape), stacked
-            // where they don't (portrait).
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 14) { graphs }
-                VStack(spacing: 8) { graphs }
+                if stats.macPending > 0 { metric("queue", "\(stats.macPending)") }
+                if stats.decodeFlushes > 0 { metric("flushes", "\(stats.decodeFlushes)") }
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 9)
-        .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
-        .padding(.horizontal, 8)
+    }
+
+    private func diagnosticSection<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title.uppercased())
+                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.45))
+            FlowLayout(hSpacing: 14, vSpacing: 6) { content() }
+        }
     }
 
     @ViewBuilder
@@ -493,23 +558,21 @@ struct PerfOverlay: View {
                 .foregroundStyle(.white)
             Text(label)
                 .font(.system(size: 8, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.5))
+                .foregroundStyle(.white.opacity(0.55))
         }
+        .fixedSize()
     }
 
-    private func graph(_ label: String, _ content: BarGraph) -> some View {
-        VStack(spacing: 2) {
-            content.frame(width: 220, height: 38)
+    private func graph(_ label: String, _ view: some View) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
             Text(label)
-                .font(.system(size: 8, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.5))
+                .font(.system(size: 7, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.45))
+            view.frame(minWidth: 160, maxWidth: .infinity).frame(height: 32)
         }
     }
 }
 
-/// Left-aligned wrapping row: children flow onto as many rows as the
-/// proposed width requires. Keeps the perf overlay inside the screen in
-/// portrait instead of clipping off both edges.
 struct FlowLayout: Layout {
     var hSpacing: CGFloat = 14
     var vSpacing: CGFloat = 8
@@ -590,6 +653,7 @@ struct SettingsView: View {
     @ObservedObject var receiver: PhoneReceiver
     @Environment(\.dismiss) private var dismiss
     @AppStorage("showAnalytics") private var showAnalytics = false
+    @AppStorage("showDetailedAnalytics") private var showDetailedAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
 
     private var version: String {
@@ -624,11 +688,14 @@ struct SettingsView: View {
 
                 Section {
                     Toggle("Performance overlay", isOn: $showAnalytics)
+                    if showAnalytics {
+                        Toggle("Detailed diagnostics", isOn: $showDetailedAnalytics)
+                    }
                     Toggle("Metal renderer (experimental)", isOn: $metalRenderer)
                 } header: {
                     Text("Analytics")
                 } footer: {
-                    Text("The overlay shows FPS, bitrate, frame timing, stalls, and latency graphs at the bottom of the screen while streaming. The experimental Metal renderer decodes and presents frames manually — it adds decode and true on-glass latency metrics to the overlay, but in our measurements the system video layer displays frames faster. Leave it off unless you're debugging.")
+                    Text("The compact overlay keeps only transport, latency, FPS, throughput, link details, and an audio latency estimate. Enable Detailed diagnostics for the full pipeline counters and graphs. The experimental Metal renderer decodes and presents frames manually — it adds decode and true on-glass latency metrics to the overlay, but in our measurements the system video layer displays frames faster. Leave it off unless you're debugging.")
                 }
 
                 Section {
