@@ -830,7 +830,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             case .usb:
                 label = "USB"
             case .tcp(_, let requiredInterface):
-                label = requiredInterface == nil ? "WiFi" : "Direct"
+                label = requiredInterface == nil ? "WiFi" : "AWDL"
             }
             Log.info("switching \(self.endpointName) to \(label)")
             self.transport = newTransport
@@ -1048,7 +1048,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let params = NWParameters(tls: nil, tcp: options)
         // Apple peer-to-peer Wi-Fi (AWDL) is exposed through the public
         // Network.framework opt-in. Requiring the discovered awdl0 interface
-        // makes "Direct" deterministic; nil retains normal AP-routed Wi-Fi.
+        // makes "AWDL" deterministic; nil retains normal AP-routed Wi-Fi.
         if let requiredInterface {
             params.includePeerToPeer = true
             params.requiredInterface = requiredInterface
@@ -1247,7 +1247,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 case .usb:
                     transportLabel = "USB"
                 case .tcp(_, let requiredInterface):
-                    transportLabel = requiredInterface == nil ? "WiFi" : "Direct"
+                    transportLabel = requiredInterface == nil ? "WiFi" : "AWDL"
                 }
                 self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps),\"encFps\":\(encFps),\"encMs50\":\(enc50),\"encMs95\":\(enc95),\"encInFlight\":\(encodeInflightNow),\"encPeak\":\(encodeInflightPeak),\"encLimit\":\(self.maxPendingEncodes),\"wireMs50\":\(wire50),\"wireMs95\":\(wire95),\"frameKB\":\(frameKB),\"usbMbps\":\(usbMbps),\"usbLink\":\"\(usbLink)\",\"audioTxDrops\":\(self.audioPacketsDropped),\"transport\":\"\(transportLabel)\"}")
             }
