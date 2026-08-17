@@ -61,7 +61,7 @@ NSDictionary<NSString *, id> * _Nullable ODCopyAWDLLinkInfo(void) {
                 int width = send(channelObject, widthSelector);
                 if (width > 0) result[@"widthMHz"] = @(width);
             }
-            result[@"channelDescription"] = channelObject.description ?: @"";
+            result[@"channelDescription"] = [channelObject description] ?: @"";
         }
 
         struct { const char *selector; NSString *key; } numberGetters[] = {
@@ -80,16 +80,18 @@ NSDictionary<NSString *, id> * _Nullable ODCopyAWDLLinkInfo(void) {
         if (phy) {
             NSNumber *number = ODNumber(phy);
             if (number) result[@"phyMode"] = number;
-            result[@"phyDescription"] = phy.description ?: @"";
+            result[@"phyDescription"] = [phy description] ?: @"";
         }
 
         id master = ODObjectGetterWithError(radio, "AWDLMasterChannel:");
-        if (NSNumber *number = ODNumber(master)) result[@"masterChannel"] = number;
+        NSNumber *masterNumber = ODNumber(master);
+        if (masterNumber) result[@"masterChannel"] = masterNumber;
         id secondary = ODObjectGetterWithError(radio, "AWDLSecondaryMasterChannel:");
-        if (NSNumber *number = ODNumber(secondary)) result[@"secondaryMasterChannel"] = number;
+        NSNumber *secondaryNumber = ODNumber(secondary);
+        if (secondaryNumber) result[@"secondaryMasterChannel"] = secondaryNumber;
 
         id sequence = ODObjectGetterWithError(radio, "AWDLSyncChannelSequence:");
-        if (sequence) result[@"channelSequence"] = sequence.description ?: @"";
+        if (sequence) result[@"channelSequence"] = [sequence description] ?: @"";
 
         return result.count > 0 ? result : nil;
     } @catch (__unused NSException *exception) {
