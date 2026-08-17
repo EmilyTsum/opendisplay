@@ -1,0 +1,44 @@
+name: Bluetooth AAC Fast Probe
+on:
+  push:
+    branches: [research/bluetooth-aac-128k]
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Fast probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/bt-aac-fast"; mkdir -p "$OUT"
+          sw_vers > "$OUT/sw_vers.txt"
+          find /System/Library /usr/libexec /usr/sbin -maxdepth 9 \( -iname '*Bluetooth*Audio*' -o -iname '*BTAudio*' -o -iname 'bluetoothaudiod' \) 2>/dev/null | sort > "$OUT/inventory.txt" || true
+          cat "$OUT/inventory.txt"
+          # Scan only executable-ish files identified by name plus likely known frameworks/plugins.
+          { cat "$OUT/inventory.txt"; printf '%s\n' \
+            /System/Library/PrivateFrameworks/BluetoothAudio.framework/Versions/A/BluetoothAudio \
+            /System/Library/PrivateFrameworks/BluetoothAudio.framework/BluetoothAudio \
+            /System/Library/PrivateFrameworks/BluetoothAudioDSP.framework/Versions/A/BluetoothAudioDSP \
+            /System/Library/Audio/Plug-Ins/HAL/BluetoothAudioPlugIn.driver/Contents/MacOS/BluetoothAudioPlugIn \
+            /System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/Contents/MacOS/BTAudioHALPlugin \
+            /usr/libexec/bluetoothaudiod /usr/sbin/bluetoothaudiod; } | sort -u > "$OUT/candidates.txt"
+          n=0
+          while IFS= read -r p; do
+            [ -f "$p" ] || continue
+            # Ignore plist/resource files for binary strings pass.
+            file "$p" | grep -qE 'Mach-O|shared library|bundle' || continue
+            n=$((n+1)); d="$OUT/$n"; mkdir -p "$d"; echo "$p" > "$d/path.txt"
+            file "$p" > "$d/file.txt"
+            strings -a "$p" | grep -iE 'AAC|MPEG.?4|bit.?rate|128000|128.?kb|256000|320000|VBR|ABR|CBR|A2DP|codec|sample.?rate|quality|AudioConverter|AudioCodec|packet|MTU|aptX|LDAC|SBC' > "$d/hits.txt" || true
+            nm -nm "$p" 2>/dev/null | grep -iE 'AAC|codec|bitrate|A2DP|SBC' > "$d/nm-hits.txt" || true
+          done < "$OUT/candidates.txt"
+          # Narrow preference-key search in matching Bluetooth/audio resources only.
+          grep -RInaE 'AAC|A2DP|bit.?rate|128000|256000|codec' \
+             /System/Library/Audio/Plug-Ins/HAL /System/Library/PrivateFrameworks/BluetoothAudio* 2>/dev/null \
+             | head -1000 > "$OUT/resource-grep.txt" || true
+      - uses: actions/upload-artifact@v6
+        with:
+          name: bluetooth-aac-fast
+          path: ${{ runner.temp }}/bt-aac-fast
