@@ -1,0 +1,34 @@
+name: Sidecar Codec Deep Probe
+on:
+  push:
+    branches: [research/os-integration-private-api]
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v6
+      - name: Deep codec analysis
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/sidecar-codec-deep"; mkdir -p "$OUT"
+          AG=/usr/libexec/SidecarDisplayAgent
+          lipo "$AG" -thin x86_64 -output "$OUT/SidecarDisplayAgent.x86_64" || cp "$AG" "$OUT/SidecarDisplayAgent.x86_64"
+          strings -a -t x "$OUT/SidecarDisplayAgent.x86_64" | grep -iE 'HEVC|AVCVideoCodecType|avcCodec|codec=%ld|setTxCodecType|setRxCodecType|setCodecType' > "$OUT/string-offsets.txt" || true
+          otool -v -s __TEXT __cstring "$OUT/SidecarDisplayAgent.x86_64" > "$OUT/cstrings.txt" 2>&1 || true
+          otool -tvV "$OUT/SidecarDisplayAgent.x86_64" > "$OUT/disasm.txt" 2>&1 || true
+          grep -n -B40 -A100 -E 'literal pool for: "HEVC"|literal pool for: "AVCVideoCodecType"|codec=%ld' "$OUT/disasm.txt" > "$OUT/disasm-context.txt" || true
+          # AVConference is the codec/session substrate used by SidecarDisplayAgent.
+          AVC=/System/Library/PrivateFrameworks/AVConference.framework/AVConference
+          [ -e "$AVC" ] || AVC=/System/Library/PrivateFrameworks/AVConference.framework/Versions/A/AVConference
+          if [ -e "$AVC" ]; then
+            strings -a "$AVC" | grep -iE 'HEVC|H264|H\.264|AVCVideoCodec|VideoCodecType|codecType|hvc1|avc1' > "$OUT/avconference-codec-strings.txt" || true
+            nm -nm "$AVC" 2>/dev/null | grep -iE 'HEVC|H264|AVCVideoCodec|CodecType' > "$OUT/avconference-codec-nm.txt" || true
+          fi
+          SDK=$(xcrun --sdk macosx --show-sdk-path)
+          grep -RInaE 'AVCVideoCodecType|VideoCodecType.*HEVC|HEVC.*VideoCodec|H264.*VideoCodec' "$SDK/System/Library/PrivateFrameworks/AVConference.framework" 2>/dev/null > "$OUT/avconference-sdk.txt" || true
+      - uses: actions/upload-artifact@v6
+        with:
+          name: sidecar-codec-deep
+          path: ${{ runner.temp }}/sidecar-codec-deep
