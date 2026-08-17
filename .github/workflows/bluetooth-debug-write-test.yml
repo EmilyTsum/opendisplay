@@ -1,0 +1,33 @@
+name: Bluetooth Debug Write Test
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test ephemeral AACBitrate debug write/read
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > /tmp/write.m <<'SRC'
+          #import <Foundation/Foundation.h>
+          #import <objc/message.h>
+          #import <dlfcn.h>
+          int main(){ @autoreleasepool {
+            dlopen("/System/Library/PrivateFrameworks/BluetoothAudio.framework/BluetoothAudio",RTLD_NOW);
+            Class c=NSClassFromString(@"CBUtil");
+            SEL get=NSSelectorFromString(@"getBluetoothDebugSettingString:InKey:");
+            SEL set=NSSelectorFromString(@"setBluetoothDebugSetting:InKey:InValue:");
+            id (*g)(id,SEL,CFStringRef,CFStringRef)=(void*)objc_msgSend;
+            void (*s)(id,SEL,CFStringRef,CFStringRef,void*)=(void*)objc_msgSend;
+            CFStringRef section=CFSTR("A2DP"), key=CFSTR("AACBitrate");
+            NSLog(@"before=%@",g((id)c,get,section,key));
+            int32_t value=256;
+            s((id)c,set,section,key,&value);
+            NSLog(@"after-int=%@",g((id)c,get,section,key));
+          } return 0; }
+          SRC
+          clang -fobjc-arc -framework Foundation /tmp/write.m -o /tmp/write
+          /tmp/write
