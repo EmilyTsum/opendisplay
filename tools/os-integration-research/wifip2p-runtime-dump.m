@@ -21,8 +21,12 @@ int main(void) { @autoreleasepool {
     for (int i=0;i<count;i++) {
         Class cls = classes[i];
         const char *img = class_getImageName(cls);
-        if (!img || !strstr(img, "WiFiPeerToPeer.framework")) continue;
-        printf("CLASS %s\n", class_getName(cls));
+        const char *cn = class_getName(cls);
+        NSString *cns = [[NSString stringWithUTF8String:cn ?: ""] lowercaseString];
+        BOOL nameHit = [cns containsString:@"wifi"] || [cns containsString:@"awdl"] || [cns containsString:@"p2p"] || [cns containsString:@"peer"];
+        BOOL imageHit = img && (strstr(img, "WiFiPeerToPeer") || strstr(img, "Apple80211"));
+        if (!nameHit && !imageHit) continue;
+        printf("CLASS %s IMAGE %s\n", cn, img ?: "<nil>");
         unsigned n=0; Method *ms=class_copyMethodList(cls,&n);
         for(unsigned j=0;j<n;j++) {
             const char *name=sel_getName(method_getName(ms[j]));
