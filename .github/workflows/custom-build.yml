@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - feature/hevc-120hz-device-identity
+      - feature/ultra-low-latency-pcm
 
 permissions:
   contents: read
