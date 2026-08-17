@@ -1,0 +1,39 @@
+name: Bluetooth AAC Deep Probe
+on:
+  push:
+    branches: [research/bluetooth-aac-128k]
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v6
+      - name: Deep HAL analysis
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/bt-aac-deep"; mkdir -p "$OUT"
+          BIN=/System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/Contents/MacOS/BTAudioHALPlugin
+          DAEMON=/usr/sbin/bluetoothaudiod
+          sw_vers > "$OUT/sw_vers.txt"
+          plutil -p /System/Library/LaunchAgents/com.apple.bluetoothaudiod.plist > "$OUT/bluetoothaudiod-launch.plist.txt" || true
+          defaults read bluetoothaudiod > "$OUT/defaults-bluetoothaudiod.txt" 2>&1 || true
+          defaults read com.apple.BluetoothAudioAgent > "$OUT/defaults-BluetoothAudioAgent.txt" 2>&1 || true
+          strings -a -t x "$BIN" | grep -iE 'SetLinkAdaptiveEncoderRateFromBT|Target Bitrate|Actual target Bitrate|AAC Bitrate|AAC max|128000|256000|320000|Bad48KHz|allowlist|A2DP configured|VBR max' > "$OUT/string-offsets.txt" || true
+          strings -a "$BIN" | grep -iE 'AAC|A2DP|LinkAdapt|Bitrate|BitRate|bandwidth|packet size|frame size|allowlist|48 KHz|48KHz|RSSI|retrans|quality' > "$OUT/hal-focused-strings.txt" || true
+          strings -a "$DAEMON" | grep -iE 'AAC|A2DP|LinkAdapt|Bitrate|BitRate|bandwidth|packet size|frame size|allowlist|48 KHz|48KHz|RSSI|retrans|quality' > "$OUT/daemon-focused-strings.txt" || true
+          lipo "$BIN" -thin x86_64 -output "$OUT/BTAudioHALPlugin.x86_64" || cp "$BIN" "$OUT/BTAudioHALPlugin.x86_64"
+          otool -v -s __TEXT __cstring "$OUT/BTAudioHALPlugin.x86_64" > "$OUT/cstrings.txt" 2>&1 || true
+          otool -tvV "$OUT/BTAudioHALPlugin.x86_64" > "$OUT/disasm.txt" 2>&1 || true
+          grep -n -B30 -A80 -E 'SetLinkAdaptiveEncoderRateFromBT|Target Bitrate trying|Actual target Bitrate|Creating AAC-LC' "$OUT/disasm.txt" > "$OUT/disasm-string-context.txt" || true
+          # Numeric constants worth checking around bitrate adaptation.
+          grep -n -E '\$0x(80|c0|100|1f400|2ee00|3e800|4e200|7d000)|\$128|\$192|\$256|128000|192000|256000|320000' "$OUT/disasm.txt" > "$OUT/disasm-bitrate-immediates.txt" || true
+          # Current preference keys / CFPreferences usage in HAL and daemon.
+          for p in "$BIN" "$DAEMON"; do
+            basename "$p" >> "$OUT/prefs-symbols.txt"
+            nm -u "$p" 2>/dev/null | grep -iE 'CFPreferences|NSUserDefaults|defaults|AudioCodec|AudioConverter' >> "$OUT/prefs-symbols.txt" || true
+          done
+      - uses: actions/upload-artifact@v6
+        with:
+          name: bluetooth-aac-deep
+          path: ${{ runner.temp }}/bt-aac-deep
