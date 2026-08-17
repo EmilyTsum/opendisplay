@@ -1,0 +1,33 @@
+name: Bluetooth Debug Settings Probe
+on:
+  push:
+    branches: [research/bluetooth-aac-128k]
+jobs:
+  probe:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+      - name: Inspect CBUtil debug settings API
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > /tmp/cbutil.m <<'SRC'
+          #import <Foundation/Foundation.h>
+          #import <objc/runtime.h>
+          #import <objc/message.h>
+          #import <dlfcn.h>
+          int main(){@autoreleasepool{
+            dlopen("/System/Library/PrivateFrameworks/BluetoothAudio.framework/BluetoothAudio",RTLD_NOW);
+            Class c=NSClassFromString(@"CBUtil"); unsigned n=0; Method *m=class_copyMethodList(object_getClass(c),&n);
+            for(unsigned i=0;i<n;i++){const char *s=sel_getName(method_getName(m[i])); if(strstr(s,"DebugSetting")) printf("%s enc=%s\n",s,method_getTypeEncoding(m[i]));} free(m);
+            SEL sel=NSSelectorFromString(@"getBluetoothDebugSettingString:InKey:");
+            if([c respondsToSelector:sel]){
+              id (*send)(id,SEL,id,id)=(void*)objc_msgSend;
+              NSArray *domains=@[@"bluetoothaudiod",@"com.apple.BluetoothAudioAgent",@"BluetoothAudio",@"A2DP"];
+              NSArray *keys=@[@"AAC Bitrate",@"Enable AAC codec",@"AAC max packet size",@"LinkAdaptEncoderBitrate",@"AACBitrate",@"Bitrate"];
+              for(NSString *d in domains)for(NSString*k in keys){id v=send((id)c,sel,d,k); if(v)printf("%s / %s = %s\n",d.UTF8String,k.UTF8String,[[v description] UTF8String]);}
+            }
+          }return 0;}
+          SRC
+          clang -fobjc-arc -framework Foundation /tmp/cbutil.m -o /tmp/cbutil
+          /tmp/cbutil
