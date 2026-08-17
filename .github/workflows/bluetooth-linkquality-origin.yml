@@ -32,6 +32,8 @@ jobs:
             [ -f "$p" ] || continue
             file "$p" >> "$OUT/bluetoothd-file.txt" || true
             strings -a -t x "$p" | grep -iE 'audio.?link.?quality|CBAudioLinkQualityInfo|bit.?rate|codec.?type|retransmit|jitter|noise.?floor|signal.?to.?noise|rssi|A2DP|AAC|LinkAdapt' > "$OUT/bluetoothd-hits.txt" || true
+            strings -a -t x "$p" > "$OUT/bluetoothd-strings.txt" || true
+            grep -n -B50 -A120 -E 'LinkAdaptiveBitrateAAC|DisableAdaptiveEncoderBitrate|Setting custom AAC Link Adaptive bitrate thresholds|Setting custom AAC Link Adaptive bitrates|adjustBitRateForMac- Codec type is AAC' "$OUT/bluetoothd-strings.txt" > "$OUT/bluetoothd-adaptive-context.txt" || true
             otool -ov "$p" > "$OUT/bluetoothd-objc.txt" 2>&1 || true
             grep -n -B12 -A30 -E 'audioLinkQuality|CBAudioLinkQualityInfo|setBitRate:|setCodecType:' "$OUT/bluetoothd-objc.txt" > "$OUT/bluetoothd-objc-context.txt" || true
           done < "$OUT/bluetoothd-paths.txt"
