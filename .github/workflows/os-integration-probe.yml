@@ -149,6 +149,31 @@ jobs:
               strings -a "$exe" | grep -Eai 'sidecar|relay|xpc|service|rapport|device|display|session|connect' > "$OUT/$b-strings.txt" || true
             fi
           done
+      - name: Probe Sidecar device status representations
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/os-probe/runtime"
+          cat > "$RUNNER_TEMP/sidecar_status.m" <<'SRC'
+          #import <Foundation/Foundation.h>
+          #import <objc/message.h>
+          #import <dlfcn.h>
+          int main(void) { @autoreleasepool {
+            dlopen("/System/Library/PrivateFrameworks/SidecarCore.framework/SidecarCore", RTLD_LAZY|RTLD_LOCAL);
+            Class c=NSClassFromString(@"SidecarDevice");
+            if(!c){puts("no SidecarDevice"); return 0;}
+            id alloc=((id(*)(id,SEL))objc_msgSend)((id)c,sel_registerName("alloc"));
+            id dev=((id(*)(id,SEL,id,id,id))objc_msgSend)(alloc,sel_registerName("initWithIdentifier:model:name:"),@"OpenDisplay-Probe",@"iPad13,8",@"OpenDisplay Probe");
+            printf("device=%s\n",[[dev description] UTF8String]);
+            for(long st=0;st<=12;st++){
+              ((void(*)(id,SEL,long))objc_msgSend)(dev,sel_registerName("setStatus:"),st);
+              long got=((long(*)(id,SEL))objc_msgSend)(dev,sel_registerName("status"));
+              printf("status=%ld desc=%s\n",got,[[dev description] UTF8String]);
+            }
+          } return 0; }
+          SRC
+          clang -fobjc-arc -framework Foundation "$RUNNER_TEMP/sidecar_status.m" -o "$RUNNER_TEMP/sidecar_status"
+          "$RUNNER_TEMP/sidecar_status" > "$OUT/sidecar-status.txt" 2>&1 || true
       - uses: actions/upload-artifact@v4
         with:
           name: os-integration-probe
