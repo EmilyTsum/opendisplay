@@ -377,3 +377,27 @@ jobs:
         with:
           name: os-integration-probe
           path: ${{ runner.temp }}/os-probe
+      - name: Probe Sidecar codec enum metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/os-probe/sidecar-codec"
+          mkdir -p "$OUT"
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          echo "$SDK" > "$OUT/sdk.txt"
+          grep -RInaE 'Sidecar.*Codec|Codec.*Sidecar|SidecarDisplay.*codec|codec.*SidecarDisplay|H264|HEVC|hvc1|avc1' \
+            "$SDK/System/Library/PrivateFrameworks" "$SDK/usr/include" 2>/dev/null \
+            | head -500 > "$OUT/sdk-grep.txt" || true
+          for p in \
+            /System/Library/PrivateFrameworks/SidecarCore.framework/SidecarCore \
+            /usr/libexec/SidecarDisplayAgent \
+            /usr/libexec/SidecarRelay; do
+            [ -e "$p" ] || continue
+            n=$(basename "$p")
+            otool -ov "$p" > "$OUT/$n-objc.txt" 2>&1 || true
+            otool -tvV "$p" > "$OUT/$n-disasm.txt" 2>&1 || true
+            nm -nm "$p" > "$OUT/$n-nm.txt" 2>&1 || true
+            strings -a "$p" | grep -iE 'codec|h264|hevc|hvc1|avc1|videotoolbox|compression|framerate|bitrate' > "$OUT/$n-codec-strings.txt" || true
+          done
+          # Keep focused metadata around codec properties/selectors.
+          grep -n -A18 -B12 -E 'codec|setCodec:' "$OUT/SidecarCore-objc.txt" > "$OUT/SidecarCore-codec-objc-context.txt" || true
