@@ -1,0 +1,41 @@
+name: Bluetooth Link Quality API Probe
+on:
+  push:
+    branches: [research/bluetooth-aac-128k]
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Inspect link-quality private API
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/bt-linkquality"; mkdir -p "$OUT"
+          cat > "$RUNNER_TEMP/api.m" <<'SRC'
+          #import <Foundation/Foundation.h>
+          #import <objc/runtime.h>
+          #import <dlfcn.h>
+          static void dump(const char *name){
+            Class c=objc_getClass(name); printf("CLASS %s %s\n",name,c?"OK":"MISSING"); if(!c)return;
+            unsigned n=0; Method *m=class_copyMethodList(c,&n); for(unsigned i=0;i<n;i++) printf(" - %s enc=%s\n",sel_getName(method_getName(m[i])),method_getTypeEncoding(m[i])); free(m);
+            Class meta=object_getClass(c); m=class_copyMethodList(meta,&n); for(unsigned i=0;i<n;i++) printf(" + %s enc=%s\n",sel_getName(method_getName(m[i])),method_getTypeEncoding(m[i])); free(m);
+            objc_property_t *p=class_copyPropertyList(c,&n); for(unsigned i=0;i<n;i++) printf(" P %s attrs=%s\n",property_getName(p[i]),property_getAttributes(p[i])); free(p);
+          }
+          int main(){@autoreleasepool{
+            dlopen("/System/Library/PrivateFrameworks/BluetoothAudio.framework/BluetoothAudio",RTLD_NOW);
+            for(const char *n: (const char*[]){"CBController","CBControllerInfo","CBAudioLinkQualityInfo","CBDevice",NULL}){if(!n)break;dump(n);}
+          }return 0;}
+          SRC
+          # Objective-C doesn't support the C++ range loop used above; patch simple calls.
+          perl -0777 -i -pe 's/for\(const char \*n: \(const char\*\[\]\)\{"CBController","CBControllerInfo","CBAudioLinkQualityInfo","CBDevice",NULL\}\)\{if\(!n\)break;dump\(n\);\}/dump("CBController"); dump("CBControllerInfo"); dump("CBAudioLinkQualityInfo"); dump("CBDevice");/' "$RUNNER_TEMP/api.m"
+          clang -fobjc-arc -framework Foundation "$RUNNER_TEMP/api.m" -o "$RUNNER_TEMP/api"
+          "$RUNNER_TEMP/api" > "$OUT/api.txt" 2>&1 || true
+          cat "$OUT/api.txt"
+          SDK=$(xcrun --sdk macosx --show-sdk-path)
+          grep -RInaE 'CBAudioLinkQualityInfo|audioLinkQualityArray|CBControllerInfo' "$SDK/System/Library/Frameworks" "$SDK/System/Library/PrivateFrameworks" 2>/dev/null > "$OUT/sdk.txt" || true
+      - uses: actions/upload-artifact@v6
+        with:
+          name: bluetooth-linkquality-api
+          path: ${{ runner.temp }}/bt-linkquality
