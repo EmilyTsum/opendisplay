@@ -1,0 +1,56 @@
+name: Bluetooth Audio Runtime Probe
+on:
+  push:
+    branches: [research/bluetooth-aac-128k]
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Enumerate BluetoothAudio private runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/bt-audio-runtime"; mkdir -p "$OUT"
+          cat > "$RUNNER_TEMP/bt_runtime.m" <<'SRC'
+          #import <Foundation/Foundation.h>
+          #import <objc/runtime.h>
+          #import <dlfcn.h>
+          static NSSet *classes(void) {
+            int n=objc_getClassList(NULL,0); Class *c=calloc(n,sizeof(Class)); objc_getClassList(c,n);
+            NSMutableSet *s=[NSMutableSet set]; for(int i=0;i<n;i++) [s addObject:NSStringFromClass(c[i])]; free(c); return s;
+          }
+          static BOOL interesting(NSString *s) {
+            NSString *l=s.lowercaseString;
+            for(NSString *k in @[@"bluetooth",@"audio",@"a2dp",@"aac",@"codec",@"bitrate",@"link",@"quality",@"packet",@"stream"]) if([l containsString:k]) return YES;
+            return NO;
+          }
+          int main(void){ @autoreleasepool {
+            NSSet *before=classes();
+            const char *paths[]={
+              "/System/Library/PrivateFrameworks/BluetoothAudio.framework/BluetoothAudio",
+              "/System/Library/PrivateFrameworks/BluetoothAudio.framework/Versions/A/BluetoothAudio",
+              NULL};
+            void *h=NULL; for(int i=0;paths[i];i++){ h=dlopen(paths[i],RTLD_NOW); if(h){printf("DLOPEN %s OK\n",paths[i]);break;} }
+            if(!h){printf("DLOPEN failed %s\n",dlerror());return 0;}
+            NSSet *after=classes(); NSMutableSet *delta=[after mutableCopy]; [delta minusSet:before];
+            NSArray *names=[[delta allObjects] sortedArrayUsingSelector:@selector(compare:)];
+            for(NSString *name in names){
+              Class cls=NSClassFromString(name); BOOL classInteresting=interesting(name); NSMutableArray *methods=[NSMutableArray array];
+              unsigned n=0; Method *ms=class_copyMethodList(cls,&n);
+              for(unsigned i=0;i<n;i++){NSString *m=NSStringFromSelector(method_getName(ms[i])); if(interesting(m)) [methods addObject:m];}
+              free(ms); Class meta=object_getClass(cls); ms=class_copyMethodList(meta,&n);
+              for(unsigned i=0;i<n;i++){NSString *m=[@"+" stringByAppendingString:NSStringFromSelector(method_getName(ms[i]))]; if(interesting(m)) [methods addObject:m];}
+              free(ms);
+              if(classInteresting || methods.count){ printf("CLASS %s\n",name.UTF8String); for(NSString *m in methods) printf("  %s\n",m.UTF8String); }
+            }
+          } return 0; }
+          SRC
+          clang -fobjc-arc -framework Foundation "$RUNNER_TEMP/bt_runtime.m" -o "$RUNNER_TEMP/bt_runtime"
+          "$RUNNER_TEMP/bt_runtime" > "$OUT/runtime.txt" 2>&1 || true
+          cat "$OUT/runtime.txt"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: bluetooth-audio-runtime
+          path: ${{ runner.temp }}/bt-audio-runtime
