@@ -1,0 +1,56 @@
+name: USB IORegistry Probe
+on:
+  push:
+    branches: [research/usb-link-ioreg]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+      - name: Inspect IOUSB registry and profiler schemas
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '== sw_vers =='; sw_vers
+          echo '== IOUSB text keys =='
+          ioreg -p IOUSB -l -w0 | grep -Ei 'location|speed|serial|usb product|usb address|port' | head -300 || true
+          echo '== IOUSB plist key inventory =='
+          ioreg -p IOUSB -l -w0 -a > /tmp/iousb.plist
+          python3 - <<'PY'
+          import plistlib, collections
+          obj=plistlib.load(open('/tmp/iousb.plist','rb'))
+          keys=collections.Counter()
+          samples={}
+          def walk(v):
+              if isinstance(v,dict):
+                  for k,x in v.items():
+                      kl=k.lower()
+                      if any(t in kl for t in ('speed','location','serial','usb','port')):
+                          keys[k]+=1
+                          samples.setdefault(k,repr(x)[:240])
+                      walk(x)
+              elif isinstance(v,list):
+                  for x in v: walk(x)
+          walk(obj)
+          for k,n in keys.most_common(): print(f'{n:3} {k}: {samples[k]}')
+          PY
+          echo '== profiler JSON key inventory =='
+          system_profiler SPUSBDataType -json -detailLevel full > /tmp/spusb.json
+          python3 - <<'PY'
+          import json,collections
+          obj=json.load(open('/tmp/spusb.json'))
+          keys=collections.Counter(); samples={}
+          def walk(v):
+              if isinstance(v,dict):
+                  for k,x in v.items():
+                      kl=k.lower()
+                      if any(t in kl for t in ('speed','location','serial','usb','port')):
+                          keys[k]+=1; samples.setdefault(k,repr(x)[:240])
+                      walk(x)
+              elif isinstance(v,list):
+                  for x in v: walk(x)
+          walk(obj)
+          for k,n in keys.most_common(): print(f'{n:3} {k}: {samples[k]}')
+          PY
