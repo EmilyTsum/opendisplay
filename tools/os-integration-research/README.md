@@ -39,3 +39,21 @@ Reverse-engineering of the current SidecarDisplayAgent diagnostic mapping confir
 This is not guessed from the property name: the executable contains the literal labels `H.264` and `HEVC`, and its codec-to-label branch compares the codec value directly against `0` and `1`.
 
 For real-device native Sidecar tuning, preserve the stock config and change one field at a time. The first codec experiment should therefore use `codec = @1` only after logging the stock value.
+
+
+## Native Sidecar tuner (opt-in)
+
+`sidecar-native-tune.m` copies the real stock `SidecarDisplayConfig` for a visible device and changes only fields explicitly requested on the command line. It is dry-run by default. `--apply` is required before it calls `connectToDevice:withConfig:completion:` or `disconnectFromDevice:completion:`.
+
+Examples:
+
+```sh
+clang -fobjc-arc -framework Foundation sidecar-native-tune.m -o sidecar-native-tune
+./sidecar-native-tune list
+./sidecar-native-tune dump --device 0
+./sidecar-native-tune connect --device 0 --fps 120
+./sidecar-native-tune connect --device 0 --fps 120 --apply
+./sidecar-native-tune connect --device 0 --fps 120 --codec hevc --max-mbps 100 --low-latency 1
+```
+
+Do the experiments one variable at a time. A successful completion only means Sidecar accepted the request; it does not prove the receiver actually ran at 120 Hz or used the requested codec.

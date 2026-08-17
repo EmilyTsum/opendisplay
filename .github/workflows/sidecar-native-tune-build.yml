@@ -1,0 +1,19 @@
+name: Sidecar Native Tune Build
+on:
+  push:
+    branches: [research/os-integration-private-api]
+    paths:
+      - 'tools/os-integration-research/sidecar-native-tune.m'
+      - '.github/workflows/sidecar-native-tune-build.yml'
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build native Sidecar tuner
+        run: |
+          clang -fobjc-arc -framework Foundation tools/os-integration-research/sidecar-native-tune.m -o /tmp/sidecar-native-tune
+          /tmp/sidecar-native-tune list
+          /tmp/sidecar-native-tune --help
