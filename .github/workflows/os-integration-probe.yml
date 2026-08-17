@@ -74,7 +74,7 @@ jobs:
               printf("DLOPEN\t%s\t%s\n", p.UTF8String, h?"OK":(dlerror()?:"ERR"));
             }
             int count=objc_getClassList(NULL,0);
-            Class *classes=calloc(count,sizeof(Class));
+            Class *classes=(Class *)calloc((size_t)count,sizeof(Class));
             objc_getClassList(classes,count);
             for(int i=0;i<count;i++) {
               Class c=classes[i]; const char *cn=class_getName(c);
