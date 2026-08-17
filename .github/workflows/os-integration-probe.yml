@@ -227,6 +227,34 @@ jobs:
             grep -Eai -C3 'Sidecar|ScreenMirroringDisplayDevice|ScreenMirroringController|AirPlayController' "$OUT/swift-reflection.txt" > "$OUT/swift-reflection-filtered.txt" || true
           fi
           xcrun --find swift-inspect > "$OUT/swift-inspect-path.txt" 2>&1 || true
+      - name: Probe unentitled Sidecar disconnect call path with fake device
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/os-probe/runtime"
+          cat > "$RUNNER_TEMP/sidecar_disconnect.m" <<'SRC'
+          #import <Foundation/Foundation.h>
+          #import <objc/message.h>
+          #import <dlfcn.h>
+          int main(void) { @autoreleasepool {
+            dlopen("/System/Library/PrivateFrameworks/SidecarCore.framework/SidecarCore", RTLD_LAZY|RTLD_LOCAL);
+            Class mc=NSClassFromString(@"SidecarDisplayManager"); Class dc=NSClassFromString(@"SidecarDevice");
+            id mgr=((id(*)(id,SEL))objc_msgSend)((id)mc,sel_registerName("sharedManager"));
+            id alloc=((id(*)(id,SEL))objc_msgSend)((id)dc,sel_registerName("alloc"));
+            id dev=((id(*)(id,SEL,id,id,id))objc_msgSend)(alloc,sel_registerName("initWithIdentifier:model:name:"),[NSUUID UUID],@"iPad13,8",@"OpenDisplay Fake Probe");
+            __block BOOL called=NO;
+            void (^completion)(void)=^{ called=YES; puts("completion_called=1"); };
+            @try {
+              ((void(*)(id,SEL,id,id))objc_msgSend)(mgr,sel_registerName("disconnectFromDevice:completion:"),dev,completion);
+              puts("disconnect_invoked=1");
+            } @catch(NSException *e) { printf("exception=%s\n",e.reason.UTF8String); }
+            NSDate *until=[NSDate dateWithTimeIntervalSinceNow:2.0];
+            while(!called && [until timeIntervalSinceNow]>0) [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+            printf("completion_final=%d\n",called);
+          } return 0; }
+          SRC
+          clang -fobjc-arc -framework Foundation "$RUNNER_TEMP/sidecar_disconnect.m" -o "$RUNNER_TEMP/sidecar_disconnect"
+          "$RUNNER_TEMP/sidecar_disconnect" > "$OUT/sidecar-disconnect.txt" 2>&1 || true
       - uses: actions/upload-artifact@v4
         with:
           name: os-integration-probe
