@@ -339,6 +339,40 @@ jobs:
           clang -fobjc-arc -framework Foundation \
             tools/os-integration-research/sidecar-config-dump.m \
             -o "$RUNNER_TEMP/sidecar-config-dump"
+      - name: Attribute runtime classes to AirPlay private frameworks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/os-probe/runtime"
+          cat > "$RUNNER_TEMP/airplay_delta.m" <<'SRC'
+          #import <Foundation/Foundation.h>
+          #import <objc/runtime.h>
+          #import <dlfcn.h>
+          static NSSet<NSString*> *classes(void) {
+            int n=objc_getClassList(NULL,0); Class *cs=(Class*)calloc((size_t)n,sizeof(Class)); objc_getClassList(cs,n);
+            NSMutableSet *s=[NSMutableSet setWithCapacity:n]; for(int i=0;i<n;i++) [s addObject:@(class_getName(cs[i]))]; free(cs); return s;
+          }
+          static void probe(NSString *path) {
+            NSSet *before=classes(); void *h=dlopen(path.UTF8String,RTLD_LAZY|RTLD_LOCAL);
+            printf("\nFRAMEWORK %s result=%s\n",path.UTF8String,h?"OK":(dlerror()?:"ERR"));
+            NSMutableSet *delta=[classes() mutableCopy]; [delta minusSet:before];
+            NSArray *names=[[delta allObjects] sortedArrayUsingSelector:@selector(compare:)];
+            for(NSString *name in names) {
+              Class c=NSClassFromString(name); printf("CLASS %s\n",name.UTF8String);
+              unsigned int n=0; Method *ms=class_copyMethodList(c,&n);
+              for(unsigned int i=0;i<n;i++){const char *sel=sel_getName(method_getName(ms[i])); NSString*x=@(sel).lowercaseString; if([x containsString:@"device"]||[x containsString:@"route"]||[x containsString:@"register"]||[x containsString:@"advert"]||[x containsString:@"discover"]||[x containsString:@"connect"]||[x containsString:@"screen"]||[x containsString:@"mirror"]||[x containsString:@"output"]) printf("  -%s\n",sel);} free(ms);
+              Class meta=object_getClass(c);n=0;ms=class_copyMethodList(meta,&n);
+              for(unsigned int i=0;i<n;i++){const char *sel=sel_getName(method_getName(ms[i])); NSString*x=@(sel).lowercaseString; if([x containsString:@"device"]||[x containsString:@"route"]||[x containsString:@"register"]||[x containsString:@"advert"]||[x containsString:@"discover"]||[x containsString:@"connect"]||[x containsString:@"screen"]||[x containsString:@"mirror"]||[x containsString:@"output"]) printf("  +%s\n",sel);} free(ms);
+            }
+          }
+          int main(void){@autoreleasepool{
+            probe(@"/System/Library/PrivateFrameworks/AirPlaySupport.framework/AirPlaySupport");
+            probe(@"/System/Library/PrivateFrameworks/AirPlaySender.framework/AirPlaySender");
+            probe(@"/System/Library/PrivateFrameworks/AirPlaySenderKit.framework/AirPlaySenderKit");
+          }return 0;}
+          SRC
+          clang -fobjc-arc -framework Foundation "$RUNNER_TEMP/airplay_delta.m" -o "$RUNNER_TEMP/airplay_delta"
+          "$RUNNER_TEMP/airplay_delta" > "$OUT/airplay-framework-delta.txt" 2>&1 || true
       - uses: actions/upload-artifact@v4
         with:
           name: os-integration-probe
