@@ -163,7 +163,7 @@ jobs:
             Class c=NSClassFromString(@"SidecarDevice");
             if(!c){puts("no SidecarDevice"); return 0;}
             id alloc=((id(*)(id,SEL))objc_msgSend)((id)c,sel_registerName("alloc"));
-            id dev=((id(*)(id,SEL,id,id,id))objc_msgSend)(alloc,sel_registerName("initWithIdentifier:model:name:"),@"OpenDisplay-Probe",@"iPad13,8",@"OpenDisplay Probe");
+            id dev=((id(*)(id,SEL,id,id,id))objc_msgSend)(alloc,sel_registerName("initWithIdentifier:model:name:"),[NSUUID UUID],@"iPad13,8",@"OpenDisplay Probe");
             printf("device=%s\n",[[dev description] UTF8String]);
             for(long st=0;st<=12;st++){
               ((void(*)(id,SEL,long))objc_msgSend)(dev,sel_registerName("setStatus:"),st);
