@@ -174,6 +174,37 @@ jobs:
           SRC
           clang -fobjc-arc -framework Foundation "$RUNNER_TEMP/sidecar_status.m" -o "$RUNNER_TEMP/sidecar_status"
           "$RUNNER_TEMP/sidecar_status" > "$OUT/sidecar-status.txt" 2>&1 || true
+      - name: Probe Sidecar display service metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/os-probe/runtime"
+          cat > "$RUNNER_TEMP/sidecar_service.m" <<'SRC'
+          #import <Foundation/Foundation.h>
+          #import <objc/message.h>
+          #import <dlfcn.h>
+          static id call0(id obj, const char *sel) { return ((id(*)(id,SEL))objc_msgSend)(obj,sel_registerName(sel)); }
+          static long callLong0(id obj, const char *sel) { return ((long(*)(id,SEL))objc_msgSend)(obj,sel_registerName(sel)); }
+          int main(void) { @autoreleasepool {
+            dlopen("/System/Library/PrivateFrameworks/SidecarCore.framework/SidecarCore", RTLD_LAZY|RTLD_LOCAL);
+            Class c=NSClassFromString(@"SidecarService_Display");
+            if(!c){puts("no class");return 0;}
+            id inst=call0(call0((id)c,"alloc"),"init");
+            for(const char *sel: (const char*[]){"name","minimumRapportVersion"}) {
+              SEL s=sel_registerName(sel); Method m=class_getClassMethod(c,s);
+              if(!m) continue;
+              const char *enc=method_getTypeEncoding(m);
+              if(enc && (enc[0]=='q'||enc[0]=='Q'||enc[0]=='i'||enc[0]=='I')) printf("+%s=%ld enc=%s\n",sel,callLong0((id)c,sel),enc);
+              else { id v=call0((id)c,sel); printf("+%s=%s enc=%s\n",sel,[[v description] UTF8String],enc?:""); }
+            }
+            for(const char *sel: (const char*[]){"serviceIdentifier","serviceExtension","localizedDescription","localizedItemName","symbolName"}) {
+              id v=call0(inst,sel); printf("-%s=%s class=%s\n",sel,[[v description] UTF8String],v?object_getClassName(v):"nil");
+            }
+          } return 0; }
+          SRC
+          # Objective-C++ for the tiny range-for helper.
+          clang++ -x objective-c++ -fobjc-arc -framework Foundation "$RUNNER_TEMP/sidecar_service.m" -o "$RUNNER_TEMP/sidecar_service"
+          "$RUNNER_TEMP/sidecar_service" > "$OUT/sidecar-service.txt" 2>&1 || true
       - uses: actions/upload-artifact@v4
         with:
           name: os-integration-probe
