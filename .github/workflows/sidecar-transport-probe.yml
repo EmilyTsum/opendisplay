@@ -23,4 +23,9 @@ jobs:
           echo '== swift reflection tools =='
           for t in swift-inspect swift-reflection-dump swift-demangle; do xcrun -f "$t" 2>/dev/null || true; done
           T=$(xcrun -f swift-inspect 2>/dev/null || true)
-          if [ -n "$T" ]; then "$T" "$BIN" 2>&1 | grep -i -E 'SidecarTransport|case|transport' | head -1000 || true; fi
+          if [ -n "$T" ]; then
+            echo '== swift-inspect help =='
+            "$T" --help 2>&1 | head -300 || true
+            echo '== swift-inspect direct =='
+            "$T" "$BIN" 2>&1 | head -300 || true
+          fi
