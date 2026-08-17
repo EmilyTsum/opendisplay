@@ -17,9 +17,12 @@ jobs:
           sw_vers > "$OUT/sw_vers.txt"
           uname -a > "$OUT/uname.txt"
           targets=(
-            /System/Library/PrivateFrameworks/SidecarCore.framework/Versions/A/SidecarCore
-            /System/Library/PrivateFrameworks/SidecarUI.framework/Versions/A/SidecarUI
-            /System/Library/PrivateFrameworks/AirPlaySupport.framework/Versions/A/AirPlaySupport
+            /System/Library/PrivateFrameworks/SidecarCore.framework/SidecarCore
+            /System/Library/PrivateFrameworks/SidecarUI.framework/SidecarUI
+            /System/Library/PrivateFrameworks/AirPlaySupport.framework/AirPlaySupport
+            /System/Library/PrivateFrameworks/AirPlaySender.framework/AirPlaySender
+            /System/Library/PrivateFrameworks/AirPlaySenderKit.framework/AirPlaySenderKit
+            /System/Library/CoreServices/AirPlayUIAgent.app/Contents/MacOS/AirPlayUIAgent
             /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
           )
           for f in "${targets[@]}"; do
@@ -31,7 +34,9 @@ jobs:
               codesign -dvvv --entitlements :- "$f" > "$d/codesign.txt" 2>&1 || true
               otool -L "$f" > "$d/otool-L.txt" 2>&1 || true
               nm -gU "$f" > "$d/nm-global.txt" 2>&1 || true
-              strings -a "$f" | grep -Eai 'sidecar|airplay|mirror|display|device|session|output|continuity|awdl|screen' > "$d/strings-filtered.txt" || true
+              strings -a "$f" > "$d/strings-all.txt" || true
+              grep -Eai 'sidecar|airplay|mirror|display|device|session|output|continuity|awdl|screen|route|receiver|sender|endpoint|connect' "$d/strings-all.txt" > "$d/strings-filtered.txt" || true
+              grep -E '^[_A-Za-z][A-Za-z0-9_.$-]{3,}$|^[+-]\[[^]]+\]$|^[a-zA-Z_][a-zA-Z0-9_]+:$' "$d/strings-all.txt" > "$d/objc-ish.txt" || true
             else
               echo MISSING > "$d/file.txt"
             fi
@@ -39,12 +44,6 @@ jobs:
           # Inventory related frameworks, daemons, launchd units, plug-ins.
           find /System/Library -maxdepth 5 \( -iname '*sidecar*' -o -iname '*airplay*' -o -iname '*screenmirr*' -o -iname '*continuity*display*' \) -print > "$OUT/inventory.txt" 2>/dev/null || true
           launchctl print system 2>/dev/null | grep -Eai -C2 'sidecar|airplay|mirroring' > "$OUT/launchd.txt" || true
-          # ObjC runtime names usually survive even if most implementation lives in dyld cache.
-          for fw in SidecarCore SidecarUI AirPlaySupport; do
-            bin="/System/Library/PrivateFrameworks/$fw.framework/Versions/A/$fw"
-            [[ -e "$bin" ]] || continue
-            strings -a "$bin" | grep -E '^[-+]?\[[A-Za-z_].*\]$|^[A-Z][A-Za-z0-9_]{3,}$|^[a-zA-Z_][a-zA-Z0-9_]+:$' > "$OUT/$fw/objc-ish.txt" || true
-          done
       - uses: actions/upload-artifact@v4
         with:
           name: os-integration-probe
