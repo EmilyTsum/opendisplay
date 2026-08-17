@@ -126,6 +126,29 @@ jobs:
           SRC
           clang -fobjc-arc -framework Foundation "$RUNNER_TEMP/sidecar_getters.m" -o "$RUNNER_TEMP/sidecar_getters"
           "$RUNNER_TEMP/sidecar_getters" > "$OUT/sidecar-getters.txt" 2>&1 || true
+      - name: Inspect Sidecar relay launch services
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/os-probe/relay"
+          mkdir -p "$OUT"
+          for p in \
+            /System/Library/LaunchAgents/com.apple.sidecar-relay.plist \
+            /System/Library/LaunchAgents/com.apple.sidecar-hid-relay.plist \
+            /System/Library/LaunchDaemons/com.apple.AirPlayXPCHelper.plist; do
+            [[ -f "$p" ]] || continue
+            b=$(basename "$p" .plist)
+            cp "$p" "$OUT/$b.plist"
+            plutil -p "$p" > "$OUT/$b.txt" || true
+            exe=$(defaults read "$p" Program 2>/dev/null || true)
+            [[ -z "$exe" ]] && exe=$(plutil -extract Program raw -o - "$p" 2>/dev/null || true)
+            if [[ -n "$exe" && -e "$exe" ]]; then
+              file "$exe" > "$OUT/$b-file.txt" || true
+              codesign -dvvv --entitlements :- "$exe" > "$OUT/$b-codesign.txt" 2>&1 || true
+              otool -L "$exe" > "$OUT/$b-otool-L.txt" 2>&1 || true
+              strings -a "$exe" | grep -Eai 'sidecar|relay|xpc|service|rapport|device|display|session|connect' > "$OUT/$b-strings.txt" || true
+            fi
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: os-integration-probe
