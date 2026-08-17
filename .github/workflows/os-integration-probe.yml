@@ -1,6 +1,8 @@
 name: OS Integration Probe
 on:
   workflow_dispatch:
+  push:
+    branches: [research/os-integration-private-api]
 jobs:
   probe:
     runs-on: macos-26
