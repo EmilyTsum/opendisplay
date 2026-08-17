@@ -1,0 +1,73 @@
+name: Custom 8 Release
+on:
+  push:
+    branches: [research/usb-link-ioreg]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: macos-26
+    env:
+      TARGET_SHA: ca47e9a5da9f1f79733e1a0c51cc0812e52d1576
+      TAG: v1.16.1-custom.8
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TARGET_SHA }}
+      - run: brew install xcodegen
+      - run: DEVELOPMENT_TEAM= xcodegen generate
+      - name: Tests
+        run: |
+          xcodebuild test -project OpenSidecar.xcodeproj -scheme OpenSidecarMac \
+            -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+      - name: Build Mac and iOS
+        run: |
+          set -euo pipefail
+          xcodebuild -project OpenSidecar.xcodeproj -scheme OpenSidecarMac -configuration Release \
+            -derivedDataPath build/mac CODE_SIGNING_ALLOWED=NO MARKETING_VERSION=1.16.1-custom CURRENT_PROJECT_VERSION=20 build
+          APP="build/mac/Build/Products/Release/OpenDisplay.app"
+          codesign --force --deep --sign - --entitlements Mac/OpenSidecarMac.entitlements "$APP"
+          mkdir -p build/release
+          hdiutil create -volname "OpenDisplay Custom" -srcfolder "$APP" -ov -format UDZO build/release/OpenDisplay-custom.dmg
+
+          xcodebuild -project OpenSidecar.xcodeproj -scheme OpenSidecariOS -configuration Release -sdk iphoneos \
+            -derivedDataPath build/ios CODE_SIGNING_ALLOWED=NO PRODUCT_BUNDLE_IDENTIFIER=com.emilytsum.opendisplay.custom \
+            MARKETING_VERSION=1.16.1-custom CURRENT_PROJECT_VERSION=20 build
+          IOSAPP="$(find build/ios/Build/Products/Release-iphoneos -maxdepth 1 -type d -name '*.app' | head -1)"
+          mkdir -p build/ipa/Payload
+          cp -R "$IOSAPP" build/ipa/Payload/
+          (cd build/ipa && ditto -c -k --sequesterRsrc --keepParent Payload ../release/OpenDisplay-custom.ipa)
+          shasum -a 256 build/release/* | tee build/release/SHA256SUMS.txt
+      - name: Create prerelease directly from runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/notes.md <<'EOF'
+          Experimental custom build based on OpenDisplay v1.16.1.
+
+          ### Ultra-low-latency PCM
+          - Dedicated PCM TCP lane separate from the video flow on AWDL/Wi-Fi/USB.
+          - 5 ms PCM chunks, 2.5 ms preferred iOS I/O buffer, shallow latest-first playback queue.
+          - Audio HUD telemetry for capture span, send latency, arrival age, queue, I/O/output latency, drops/resyncs/gaps.
+
+          ### AWDL / identity hardening
+          - Coalesces infrastructure Wi-Fi and AWDL Bonjour observations into one device identity and prefers AWDL.
+          - USB/Wi-Fi/AWDL merge uses the receiver install ID; a known ID mismatch no longer falls back to an equal display name.
+
+          ### USB link telemetry
+          - Reads negotiated USB line rate directly from IORegistry `UsbLinkSpeed` before falling back to system_profiler.
+          - LocationID comparison is normalized as the 32-bit USB topology value.
+
+          Includes previous custom HEVC/H.264 120 Hz, ProRes LT/Proxy, AWDL, detailed HUD and PCM features.
+          Physical device validation is still required; this is a prerelease.
+          EOF
+          for i in 1 2 3 4 5; do
+            gh release delete "$TAG" --repo EmilyTsum/opendisplay --yes >/dev/null 2>&1 || true
+            if gh release create "$TAG" build/release/OpenDisplay-custom.dmg build/release/OpenDisplay-custom.ipa build/release/SHA256SUMS.txt \
+              --repo EmilyTsum/opendisplay --target "$TARGET_SHA" --title "$TAG" --notes-file /tmp/notes.md --prerelease; then
+              exit 0
+            fi
+            sleep 8
+          done
+          exit 1
