@@ -130,9 +130,11 @@ final class DeviceSession: ObservableObject, Identifiable {
     var deviceKind: String?
     var advertisedName: String?
     // `target` names the identity the session was created for; the live
-    // transport can migrate (cable-in upgrade, unplug failover) — these
-    // track where the sender actually is right now.
-    @Published var onUSB: Bool
+    // socket can migrate independently. Keep the actual route explicit so
+    // AWDL and infrastructure Wi-Fi never collapse into a Boolean "wireless".
+    @Published var transportKind: TransportKind
+    var routePolicy: TransportPolicy
+    var onUSB: Bool { transportKind == .usb }
     // The udid the session is (or was last) cabled through, so a usbmuxd
     // detach can be matched back to this session for failover.
     var usbUDID: String?
@@ -143,19 +145,17 @@ final class DeviceSession: ObservableObject, Identifiable {
     // and its service row.
     var wifiServiceName: String?
 
-    var transportLabel: String { onUSB ? "USB" : "WiFi" }
+    var transportLabel: String { transportKind.displayName }
 
-    init(id: String, target: ConnectionTarget, name: String, sender: MacSender) {
+    init(id: String, target: ConnectionTarget, name: String, sender: MacSender,
+         transportKind: TransportKind) {
         self.id = id
         self.target = target
         self.name = name
         self.sender = sender
-        if case .usb(let udid) = target {
-            onUSB = true
-            usbUDID = udid
-        } else {
-            onUSB = false
-        }
+        self.transportKind = transportKind
+        self.routePolicy = TransportPolicy(initial: transportKind)
+        if case .usb(let udid) = target { usbUDID = udid }
     }
 }
 
@@ -176,6 +176,7 @@ final class SenderController: ObservableObject {
 
     @Published var sessions: [DeviceSession] = []
     @Published var discovered: [NWBrowser.Result] = []
+    private var rawDiscovered: [NWBrowser.Result] = []
     @Published var usbDevices: [UsbmuxDevice] = []
     // `-host x.x.x.x` / `-port n` bypass usbmuxd with a manual TCP endpoint
     // (debugging escape hatch, e.g. an iproxy or SSH tunnel).
@@ -201,21 +202,12 @@ final class SenderController: ObservableObject {
     private var browser: NWBrowser?
     private var usbWatcher: UsbmuxDeviceWatcher?
 
-    // Connection policy — one session per physical device, and the cable
-    // wins whenever it's available (lower, steadier latency than WiFi):
-    //
-    //  - USB devices connect on attach ("plug in and go") unless the user
-    //    explicitly disconnected them once (usbDisabled).
-    //  - Plugging the cable in while the device streams over WiFi migrates
-    //    the live session onto USB; unplugging it fails over to WiFi when
-    //    the device's service is visible — otherwise the session ends after
-    //    the usual grace. Migrations swap only the socket (switchTransport):
-    //    the virtual display survives, so no screen flash, no window
-    //    reshuffle — the earlier no-switching policy existed because
-    //    migration used to mean destroying and recreating the session.
-    //  - WiFi devices the user connected before (wifiRemembered) reconnect
-    //    in a short window at LAUNCH only — never mid-session.
-    // `-autostart NO` disables all auto-connecting, including migrations.
+    // Connection policy — one session per physical device. USB, AWDL and
+    // infrastructure Wi-Fi are route candidates, not a priority list. The
+    // active session stays alive while TransportPolicy probes stale/unknown
+    // alternatives and migrates only the socket through MacSender. A route
+    // failure bypasses hysteresis for immediate failover.
+    // `-autostart NO` disables automatic session creation and migration.
     private var usbDisabled = Set(UserDefaults.standard.stringArray(forKey: "usbDisabled") ?? []) {
         didSet { UserDefaults.standard.set(Array(usbDisabled), forKey: "usbDisabled") }
     }
@@ -271,6 +263,7 @@ final class SenderController: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 let rawResults = Array(results)
+                self.rawDiscovered = rawResults
                 self.discovered = self.preferredBonjourResults(rawResults)
                 if self.discovered.count != rawResults.count {
                     Log.info("coalesced \(rawResults.count) Bonjour routes into \(self.discovered.count) device identities")
@@ -295,6 +288,22 @@ final class SenderController: ObservableObject {
     /// Bonjour endpoint/interface association for us.
     private func peerToPeerInterface(for result: NWBrowser.Result) -> NWInterface? {
         result.interfaces.first { $0.name.lowercased().hasPrefix("awdl") }
+    }
+
+    private func infrastructureWiFiInterface(for result: NWBrowser.Result) -> NWInterface? {
+        result.interfaces.first { interface in
+            interface.type == .wifi && !interface.name.lowercased().hasPrefix("awdl")
+        }
+    }
+
+    /// Strip the interface baked into a Bonjour observation. The route itself
+    /// is constrained explicitly with NWParameters.requiredInterface so the
+    /// same service can be dialed independently over AWDL and en0-style Wi-Fi.
+    private func routeEndpoint(for result: NWBrowser.Result) -> NWEndpoint {
+        if case .service(let name, let type, let domain, _) = result.endpoint {
+            return .service(name: name, type: type, domain: domain, interface: nil)
+        }
+        return result.endpoint
     }
 
     /// Coalesce infrastructure Wi-Fi and AWDL observations of the same
@@ -398,10 +407,10 @@ final class SenderController: ObservableObject {
         }
         for device in usbDevices {
             if let covering = activeSession(coveringUSB: device) {
-                // usbDisabled gates auto-connecting a device, not the
-                // transport of a session the user deliberately has running —
-                // however it was started, the cable is better: take it.
-                upgradeToUSB(covering, device: device)
+                // Cable presence only makes USB eligible. Never steal a good
+                // AWDL/Wi-Fi stream merely because a cable appeared.
+                covering.usbUDID = device.udid
+                if let id = covering.deviceID { installIDByUDID[device.udid] = id }
             } else if !usbDisabled.contains("usb:\(device.udid)") {
                 connect(to: .usb(udid: device.udid))
             }
@@ -425,33 +434,15 @@ final class SenderController: ObservableObject {
         }
     }
 
-    /// Cable plugged in while the device streams over WiFi: migrate the live
-    /// session onto USB. No-op when the session is already cabled.
-    private func upgradeToUSB(_ session: DeviceSession, device: UsbmuxDevice) {
-        guard !session.onUSB, let portNum = UInt16(port) else { return }
-        Log.info("cable attached for \(session.id) — migrating to USB")
-        session.onUSB = true
-        session.usbUDID = device.udid
-        // The match may have been by name only — pin the strong identity so
-        // future matching (and the next launch) recognizes the pair.
-        if let id = session.deviceID { installIDByUDID[device.udid] = id }
-        session.sender.switchTransport(to: .usb(udid: device.udid, port: portNum))
-    }
-
     /// Cable unplugged under a live session: fail over to the device's WiFi
     /// service if one is visible. Without one the session keeps its normal
     /// fate — retry over USB through the grace period, then end.
     private func failover(detachedUDIDs: Set<String>) {
         guard autoConnectEnabled, !detachedUDIDs.isEmpty else { return }
-        for session in sessions where session.onUSB {
-            guard let udid = session.usbUDID, detachedUDIDs.contains(udid),
-                  let result = wifiService(for: session) else { continue }
-            Log.info("cable detached for \(session.id) — failing over to WiFi")
-            session.onUSB = false
-            session.wifiServiceName = serviceName(of: result)
-            session.sender.switchTransport(to: .tcp(
-                result.endpoint,
-                requiredInterface: peerToPeerInterface(for: result)))
+        for session in sessions where session.transportKind == .usb {
+            guard let udid = session.usbUDID, detachedUDIDs.contains(udid) else { continue }
+            Log.info("cable detached for \(session.id) — immediate route failover")
+            handleTransportFailure(session, failed: .usb)
         }
     }
 
@@ -464,7 +455,7 @@ final class SenderController: ObservableObject {
     /// withdrawal that persists counts. One-shot, guarded re-check, so
     /// overlapping browse events at worst repeat an idempotent call.
     private func endSessionsWhoseServiceVanished() {
-        for session in sessions where !session.onUSB {
+        for session in sessions where session.transportKind != .usb {
             guard wifiService(for: session) == nil else { continue }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self, weak session] in
                 guard let self, let session,
@@ -477,7 +468,7 @@ final class SenderController: ObservableObject {
 
     /// The discovered WiFi service belonging to this session's device.
     private func wifiService(for session: DeviceSession) -> NWBrowser.Result? {
-        discovered.first { result in
+        rawDiscovered.first { result in
             if let id = txtID(of: result), let deviceID = session.deviceID {
                 return id == deviceID
             }
@@ -489,23 +480,30 @@ final class SenderController: ObservableObject {
     /// Safety net, not a feature: if identity was learned too late (old
     /// receiver, renamed service) and one physical device ended up with two
     /// sessions, the transports steal the receiver's single connection from
-    /// each other forever. Keep the cable, drop the WiFi twin.
+    /// each other forever. First eliminate exact session-ID twins (which can
+    /// otherwise become orphan senders), then keep the cable over WiFi.
     private func dedupeSessions() {
-        let usbSessionIDs = Set(sessions.compactMap { s -> String? in
-            if case .usb = s.target { return s.deviceID }
-            return nil
-        })
-        let cabledNames = Set(usbDevices.compactMap { device in
-            session(for: "usb:\(device.udid)") != nil ? device.name : nil
-        })
-        for s in sessions {
-            guard case .wifi(let result) = s.target else { continue }
-            let duplicate = (s.deviceID.map { usbSessionIDs.contains($0) } ?? false)
-                || (txtID(of: result).map { usbSessionIDs.contains($0) } ?? false)
-                || (serviceName(of: result).map { cabledNames.contains($0) } ?? false)
-            if duplicate {
-                Log.info("two sessions for one device — keeping the cable, dropping \(s.id)")
-                end(s)
+        let snapshot = sessions
+        var keepByID: [String: DeviceSession] = [:]
+        for session in snapshot {
+            if let keeper = keepByID[session.id] {
+                Log.info("duplicate session \(session.id) — keeping existing \(keeper.transportLabel) pipeline")
+                if sessions.contains(where: { $0 === session }) { end(session) }
+            } else {
+                keepByID[session.id] = session
+            }
+        }
+
+        // Once hello supplies the install identity, collapse any cross-transport
+        // launch race by age/order, never by USB/AWDL/Wi-Fi preference.
+        var keepByDevice: [String: DeviceSession] = [:]
+        for session in snapshot where sessions.contains(where: { $0 === session }) {
+            guard let deviceID = session.deviceID else { continue }
+            if let keeper = keepByDevice[deviceID], keeper !== session {
+                Log.info("two sessions for one device — keeping existing \(keeper.transportLabel), dropping \(session.transportLabel)")
+                end(session)
+            } else {
+                keepByDevice[deviceID] = session
             }
         }
     }
@@ -582,10 +580,16 @@ final class SenderController: ObservableObject {
                 transport = .usb(udid: udid, port: portNum)
             }
         case .wifi(let result):
-            transport = .tcp(result.endpoint,
-                             requiredInterface: peerToPeerInterface(for: result))
+            if let awdl = peerToPeerInterface(for: result) {
+                transport = .tcp(routeEndpoint(for: result), requiredInterface: awdl)
+            } else if let wifi = infrastructureWiFiInterface(for: result) {
+                transport = .tcp(routeEndpoint(for: result), requiredInterface: wifi)
+            } else {
+                transport = .tcp(result.endpoint, requiredInterface: nil)
+            }
         }
 
+        let initialTransportKind = transportKind(for: transport)
         let name = label(for: target)
         let sender = MacSender(transport: transport, name: name, mode: mode,
                                quality: quality,
@@ -594,7 +598,8 @@ final class SenderController: ObservableObject {
                                audioEnabled: audioEnabled,
                                displaySerial: Self.displaySerial(for: id),
                                awaitingWake: awaitingWake)
-        let session = DeviceSession(id: id, target: target, name: name, sender: sender)
+        let session = DeviceSession(id: id, target: target, name: name, sender: sender,
+                                    transportKind: initialTransportKind)
         if case .wifi(let result) = target {
             session.wifiServiceName = serviceName(of: result)
         }
@@ -618,6 +623,14 @@ final class SenderController: ObservableObject {
         sender.onStats = { [weak session] frames, mbps in
             session?.framesSent = frames
             session?.mbps = mbps
+        }
+        sender.onTransportHealth = { [weak self, weak session] kind, sample in
+            guard let self, let session else { return }
+            self.handleTransportHealth(session, kind: kind, sample: sample)
+        }
+        sender.onTransportFailure = { [weak self, weak session] kind in
+            guard let self, let session else { return }
+            self.handleTransportFailure(session, failed: kind)
         }
         sender.onDisconnected = { [weak self, weak session] in
             // Device unplugged / left the network and stayed gone: end this
@@ -665,6 +678,125 @@ final class SenderController: ObservableObject {
         }
     }
 
+    private func transportKind(for transport: SenderTransport) -> TransportKind {
+        switch transport {
+        case .usb: return .usb
+        case .tcp(_, let interface):
+            return interface?.name.lowercased().hasPrefix("awdl") == true ? .awdl : .wifi
+        }
+    }
+
+    /// All currently reachable physical paths for this one receiver. Bonjour
+    /// rows remain coalesced in the UI, but route candidates stay separate.
+    private func availableTransports(for session: DeviceSession) -> [TransportKind: SenderTransport] {
+        var result: [TransportKind: SenderTransport] = [:]
+        if let portNum = UInt16(port) {
+            let usb = usbDevices.first { device in
+                if session.usbUDID == device.udid { return true }
+                if let id = session.deviceID, installIDByUDID[device.udid] == id { return true }
+                return device.name == session.advertisedName || device.name == session.name
+            }
+            if let usb, !usbDisabled.contains("usb:\(usb.udid)") {
+                result[.usb] = .usb(udid: usb.udid, port: portNum)
+            }
+        }
+
+        let routes = rawDiscovered.filter { route in
+            if let id = txtID(of: route), let deviceID = session.deviceID { return id == deviceID }
+            let name = serviceName(of: route)
+            return name != nil && (name == session.wifiServiceName
+                || name == session.advertisedName || name == session.name)
+        }
+        for route in routes {
+            let endpoint = routeEndpoint(for: route)
+            if result[.awdl] == nil, let awdl = peerToPeerInterface(for: route) {
+                result[.awdl] = .tcp(endpoint, requiredInterface: awdl)
+            }
+            if result[.wifi] == nil, let wifi = infrastructureWiFiInterface(for: route) {
+                result[.wifi] = .tcp(endpoint, requiredInterface: wifi)
+            }
+        }
+        return result
+    }
+
+    private func switchRoute(_ session: DeviceSession, to kind: TransportKind,
+                             reason: String, probing: Bool = false) {
+        guard sessions.contains(where: { $0 === session }),
+              let transport = availableTransports(for: session)[kind],
+              kind != session.transportKind else { return }
+        let from = session.transportKind
+        Log.info("\(probing ? "route probe" : "route switch") \(from.displayName) -> \(kind.displayName) (\(reason))")
+        session.transportKind = kind
+        if case .usb(let udid, _) = transport { session.usbUDID = udid }
+        if case .tcp(let endpoint, _) = transport,
+           case .service(let name, _, _, _) = endpoint { session.wifiServiceName = name }
+        if !probing { session.routePolicy.commitSwitch(to: kind) }
+        session.sender.switchTransport(to: transport)
+    }
+
+    private func handleTransportHealth(_ session: DeviceSession, kind: TransportKind,
+                                       sample: TransportHealthSample) {
+        guard sessions.contains(where: { $0 === session }), session.transportKind == kind else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        session.routePolicy.record(sample, for: kind, now: now)
+        let score = session.routePolicy.estimate(for: kind)?.score ?? sample.score
+        Log.info(String(format: "ROUTE %@ score=%.1f rtt=%.1f e2e95=%.1f stalls=%d drops=%d fps=%.0f/%.0f",
+                        kind.displayName, score, sample.rttMs, sample.e2e95Ms,
+                        sample.stalls, sample.netDrops, sample.fps, sample.captureFps))
+
+        if let outcome = session.routePolicy.probeOutcome(now: now) {
+            finishProbe(session, outcome: outcome, now: now)
+            return
+        }
+
+        let available = Set(availableTransports(for: session).keys)
+        if let better = session.routePolicy.bestCachedCandidate(available: available, now: now) {
+            let currentScore = session.routePolicy.estimate(for: session.routePolicy.current)?.score ?? 0
+            let candidateScore = session.routePolicy.estimate(for: better)?.score ?? 0
+            switchRoute(session, to: better,
+                        reason: String(format: "score %.1f vs %.1f", candidateScore, currentScore))
+            return
+        }
+        if let candidate = session.routePolicy.nextProbeCandidate(available: available, now: now),
+           session.routePolicy.beginProbe(candidate, now: now) {
+            switchRoute(session, to: candidate, reason: "candidate health sample", probing: true)
+            let timeout = session.routePolicy.configuration.probeTimeoutSeconds + 0.25
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self, weak session] in
+                guard let self, let session,
+                      self.sessions.contains(where: { $0 === session }),
+                      session.routePolicy.activeProbeCandidate == candidate,
+                      let outcome = session.routePolicy.probeOutcome() else { return }
+                self.finishProbe(session, outcome: outcome, now: ProcessInfo.processInfo.systemUptime)
+            }
+        }
+    }
+
+    private func finishProbe(_ session: DeviceSession, outcome: TransportProbeOutcome, now: TimeInterval) {
+        switch outcome {
+        case .keep(let candidate):
+            session.routePolicy.commitSwitch(to: candidate, now: now)
+            Log.info("route probe accepted — keeping \(candidate.displayName)")
+        case .revert(let baseline):
+            Log.info("route probe rejected — returning to \(baseline.displayName)")
+            switchRoute(session, to: baseline, reason: "probe rejected")
+        }
+    }
+
+    private func handleTransportFailure(_ session: DeviceSession, failed: TransportKind) {
+        guard sessions.contains(where: { $0 === session }), session.transportKind == failed else { return }
+        session.routePolicy.cancelProbe()
+        let candidates = availableTransports(for: session).keys.filter { $0 != failed }
+        guard !candidates.isEmpty else { return }
+        let candidate = candidates.min { lhs, rhs in
+            let l = session.routePolicy.estimate(for: lhs)?.score ?? Double.greatestFiniteMagnitude
+            let r = session.routePolicy.estimate(for: rhs)?.score ?? Double.greatestFiniteMagnitude
+            if l == r { return lhs.rawValue < rhs.rawValue }
+            return l < r
+        }!
+        Log.info("route failure on \(failed.displayName) — failover to \(candidate.displayName) (hysteresis bypassed)")
+        switchRoute(session, to: candidate, reason: "route failure")
+    }
+
     /// User-initiated disconnect: also opt the device out of auto-connect.
     func disconnect(_ session: DeviceSession) {
         switch session.target {
@@ -684,7 +816,11 @@ final class SenderController: ObservableObject {
 
     private func end(_ session: DeviceSession) {
         session.sender.stop()
-        sessions.removeAll { $0.id == session.id }
+        // Remove the exact object we stopped. Removing by `id` could erase a
+        // sibling session from the controller without stopping its MacSender,
+        // leaving a zombie pipeline that kept redialing and stealing the
+        // receiver connection forever.
+        sessions.removeAll { $0 === session }
     }
 
     /// Mode/quality apply per-pipeline at construction — rebuild every session.

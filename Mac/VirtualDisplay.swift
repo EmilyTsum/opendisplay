@@ -9,7 +9,7 @@ final class VirtualDisplay {
     private let display: CGVirtualDisplay
     private var settings: CGVirtualDisplaySettings
     private let maxPointsPerAxis: Int
-    private let refreshRate: Int
+    private var refreshRate: Int
     private(set) var pointsWide: Int
     private(set) var pointsHigh: Int
 
@@ -19,6 +19,7 @@ final class VirtualDisplay {
     private let onOriginChange: ((CGPoint, CGSize) -> Void)?
 
     var displayID: CGDirectDisplayID { display.displayID }
+    var actualRefreshRate: Int { refreshRate }
     var isUsable: Bool {
         !CGDisplayBounds(displayID).isEmpty
             && CGDisplayIsOnline(displayID) != 0
@@ -63,13 +64,41 @@ final class VirtualDisplay {
 
         settings = CGVirtualDisplaySettings()
         settings.hiDPI = 1
-        settings.modes = [
-            CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh),
-                                 refreshRate: Double(self.refreshRate))
-        ]
-        guard display.apply(settings) else {
-            Log.info("CGVirtualDisplay applySettings FAILED")
-            return nil
+
+        // High-refresh virtual displays are materially more reliable when the
+        // requested native cadence and a 60 Hz fallback are advertised in the
+        // same settings object. WindowServer may still reject that settings
+        // list on some saved identities; in that local-display failure case
+        // retry once with 60 Hz only. Network state is intentionally untouched.
+        let requestedRefreshRate = self.refreshRate
+        settings.modes = requestedRefreshRate > 60
+            ? [
+                CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh),
+                                     refreshRate: Double(requestedRefreshRate)),
+                CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh),
+                                     refreshRate: 60),
+            ]
+            : [
+                CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh),
+                                     refreshRate: Double(requestedRefreshRate)),
+            ]
+
+        if !display.apply(settings) {
+            Log.info("CGVirtualDisplay applySettings FAILED for \(requestedRefreshRate)Hz + fallback modes")
+            guard requestedRefreshRate > 60 else { return nil }
+            let fallback = CGVirtualDisplaySettings()
+            fallback.hiDPI = 1
+            fallback.modes = [
+                CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh),
+                                     refreshRate: 60),
+            ]
+            guard display.apply(fallback) else {
+                Log.info("CGVirtualDisplay applySettings FAILED at 60Hz fallback")
+                return nil
+            }
+            settings = fallback
+            self.refreshRate = 60
+            Log.info("CGVirtualDisplay accepted local 60Hz fallback after rejecting \(requestedRefreshRate)Hz modes")
         }
         Log.info("virtual display created: id=\(display.displayID) \(pointsWide)x\(pointsHigh)pt @2x \(self.refreshRate)Hz")
 
@@ -112,15 +141,36 @@ final class VirtualDisplay {
 
         let newSettings = CGVirtualDisplaySettings()
         newSettings.hiDPI = 1
-        newSettings.modes = [
-            CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh),
-                                 refreshRate: Double(self.refreshRate))
-        ]
-        guard display.apply(newSettings) else {
-            Log.info("virtual display \(display.displayID) applySettings FAILED during resize")
-            return false
+        newSettings.modes = self.refreshRate > 60
+            ? [
+                CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh),
+                                     refreshRate: Double(self.refreshRate)),
+                CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh),
+                                     refreshRate: 60),
+            ]
+            : [
+                CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh),
+                                     refreshRate: Double(self.refreshRate)),
+            ]
+        var appliedSettings = newSettings
+        if !display.apply(newSettings) {
+            Log.info("virtual display \(display.displayID) applySettings FAILED during resize at \(self.refreshRate)Hz")
+            guard self.refreshRate > 60 else { return false }
+            let fallback = CGVirtualDisplaySettings()
+            fallback.hiDPI = 1
+            fallback.modes = [
+                CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh), refreshRate: 60),
+            ]
+            guard display.apply(fallback) else {
+                Log.info("virtual display \(display.displayID) 60Hz resize fallback FAILED")
+                return false
+            }
+            appliedSettings = fallback
+            let oldRate = self.refreshRate
+            self.refreshRate = 60
+            Log.info("virtual display cadence fell back from \(oldRate)Hz to 60Hz during resize")
         }
-        settings = newSettings
+        settings = appliedSettings
         self.pointsWide = pointsWide
         self.pointsHigh = pointsHigh
 
@@ -169,14 +219,15 @@ final class VirtualDisplay {
             return false
         }
         if let current = CGDisplayCopyDisplayMode(display.displayID),
-           current.width == hidpi.width, current.pixelWidth == hidpi.pixelWidth {
+           current.width == hidpi.width, current.pixelWidth == hidpi.pixelWidth,
+           abs(current.refreshRate - Double(refreshRate)) < 1 {
             return true
         }
         var config: CGDisplayConfigRef?
         CGBeginDisplayConfiguration(&config)
         CGConfigureDisplayWithDisplayMode(config, display.displayID, hidpi, nil)
         let err = CGCompleteDisplayConfiguration(config, .permanently)
-        Log.info("HiDPI mode (re)selected: \(hidpi.width)x\(hidpi.height)@2x (result \(err.rawValue))")
+        Log.info("HiDPI mode (re)selected: \(hidpi.width)x\(hidpi.height)@2x \(Int(hidpi.refreshRate.rounded()))Hz (result \(err.rawValue))")
         return err == .success
     }
 

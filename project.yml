@@ -95,6 +95,7 @@ targets:
       - MacTests
       - Mac/DisplayArrangement.swift
       - Mac/DisplayIdentity.swift
+      - Mac/TransportPolicy.swift
       - Mac/AWDLLinkInfo.swift
       - Mac/AWDLLinkInfo.m
       - Mac/PeerIdentity.swift

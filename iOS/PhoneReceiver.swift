@@ -188,8 +188,8 @@ final class PhoneReceiver: ObservableObject {
     private var audioIOBufferMs = 0.0
     private var audioOutputLatencyMs = 0.0
     private var audioFormatLabel = ""
-    private let maxAudioQueueMs = 15.0
-    private let maxAudioPacketAgeMs = 45.0
+    private let maxAudioQueueMs = 10.0
+    private let maxAudioPacketAgeMs = 30.0
 
     private var nowMs: Double { Date().timeIntervalSince1970 * 1000 }
 

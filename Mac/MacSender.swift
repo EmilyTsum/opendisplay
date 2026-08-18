@@ -196,6 +196,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // Status surfaced to the UI (updated on main thread).
     @MainActor var onStatus: ((String) -> Void)?
     @MainActor var onStats: ((Int, Double) -> Void)?   // framesSent, mbps
+    @MainActor var onTransportHealth: ((TransportKind, TransportHealthSample) -> Void)?
+    @MainActor var onTransportFailure: ((TransportKind) -> Void)?
     // Fired when a previously connected device stays gone past the grace
     // period — the controller ends the session (capture, virtual display,
     // recording indicator all torn down) instead of dialing forever or
@@ -225,6 +227,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // The dial target. Written on `queue` only (after init): the controller
     // can migrate a live session between transports via switchTransport.
     private var transport: SenderTransport
+    private var currentTransportKind: TransportKind {
+        switch transport {
+        case .usb:
+            return .usb
+        case .tcp(_, let requiredInterface):
+            return Self.isAWDL(requiredInterface) ? .awdl : .wifi
+        }
+    }
+    private static func isAWDL(_ interface: NWInterface?) -> Bool {
+        interface?.name.lowercased().hasPrefix("awdl") == true
+    }
     private let endpointName: String
     private let mode: CaptureMode
     private let quality: StreamQuality
@@ -307,12 +320,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var audioPacketsSent = 0
     private var audioBytesSent = 0
     private var pendingAudioSends = 0
-    private let maxPendingAudioSends = 2
+    private let maxPendingAudioSends = 3
     private var audioPacketsDropped = 0
     private var audioPCMAccumulator = Data()
     private var audioAccumulatorCaptureMs: Double?
     private var audioSequence: UInt32 = 0
-    private let audioChunkFrames = 240        // 5 ms @ 48 kHz
+    private let audioChunkFrames = 120        // 2.5 ms @ 48 kHz
     private var audioCaptureBufferMs = 0.0
     private var audioLaneSendP50 = 0.0
     private var audioLaneSendP95 = 0.0
@@ -549,10 +562,16 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // = native pixels / 2 (rounded down to even for the encoder).
         let pointsWide = (info.pixelsWide / 2) & ~1
         let pointsHigh = (info.pixelsHigh / 2) & ~1
-        // Rough physical size so macOS picks a sane default UI scale.
-        let mm = info.pixelsWide >= info.pixelsHigh
-            ? CGSize(width: 147, height: 68)
-            : CGSize(width: 68, height: 147)
+        // Keep the descriptor's physical size in the same density range as
+        // the real panel. CGVirtualDisplay can reject implausibly dense
+        // descriptors; the old phone-sized 147x68 mm constant made a
+        // 2388x1668 iPad look like a >400–600 ppi desktop monitor. iPads are
+        // predominantly ~264 ppi, while modern iPhones are roughly ~460 ppi.
+        // This value only informs macOS display metadata/UI scaling — the
+        // framebuffer remains exact native pixels.
+        let nominalPPI: Double = info.kind.lowercased().contains("ipad") ? 264 : 460
+        let mm = CGSize(width: Double(info.pixelsWide) / nominalPPI * 25.4,
+                        height: Double(info.pixelsHigh) / nominalPPI * 25.4)
 
         // The receiver's Settings name is the canonical user-facing name on
         // *both* USB and WiFi. lockdownd's USB name is the iPad system name and
@@ -604,6 +623,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
 
             guard let candidate else {
+                // applySettings can fail for a saved/poisoned display identity
+                // before a CGVirtualDisplay ever becomes observable. The old
+                // recovery only rolled the serial after successful creation,
+                // so this failure mode retried the same bad identity forever.
+                if let deviceID = info.id, identityAttempt < 3 {
+                    let failedSerial = serial
+                    serial = DisplayIdentity.rollover(for: deviceID)
+                    displaySerial = serial
+                    Log.info(String(format:
+                        "virtual display identity %08X rejected settings — rolling to %08X (attempt %d)",
+                        failedSerial, serial, identityAttempt + 1))
+                    await status("Repairing virtual display identity…")
+                    continue identityLoop
+                }
                 throw NSError(domain: "MacSender", code: 2,
                               userInfo: [NSLocalizedDescriptionKey: "CGVirtualDisplay creation failed"])
             }
@@ -635,6 +668,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         virtualDisplay = vd
         inputInjector = InputInjector(displayID: vd.displayID)
+        if vd.actualRefreshRate != activeFrameRate {
+            let requested = activeFrameRate
+            activeFrameRate = vd.actualRefreshRate
+            Log.info("virtual display cadence fell back from \(requested)Hz to \(activeFrameRate)Hz")
+        }
 
         let display = try await findSCDisplay(id: vd.displayID)
         // Quality scaling: capture/encode below native when requested — the
@@ -712,6 +750,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                       movingTo: DisplayArrangement.origin(for: size, device: arrangementKey))
         }
         guard didResize else { return false }
+        if vd.actualRefreshRate != activeFrameRate {
+            let requested = activeFrameRate
+            activeFrameRate = vd.actualRefreshRate
+            Log.info("virtual display cadence fell back from \(requested)Hz to \(activeFrameRate)Hz")
+        }
 
         let display = try await findSCDisplay(id: vd.displayID, expectedSize: size)
         let captureW = (Int(Double(pointsWide * 2) * quality.scale)) & ~1
@@ -852,14 +895,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     func switchTransport(to newTransport: SenderTransport) {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
-            let label: String
+            let kind: TransportKind
             switch newTransport {
             case .usb:
-                label = "USB"
+                kind = .usb
             case .tcp(_, let requiredInterface):
-                label = requiredInterface == nil ? "WiFi" : "AWDL"
+                kind = Self.isAWDL(requiredInterface) ? .awdl : .wifi
             }
-            Log.info("switching \(self.endpointName) to \(label)")
+            Log.info("switching \(self.endpointName) to \(kind.displayName)")
             self.transport = newTransport
             self.usbLinkProbeGeneration += 1
             self.usbLinkInfo = nil
@@ -1011,7 +1054,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Bookkeeping shared by both transports once a connection is live.
     private func becomeReady(_ conn: NWConnection) {
-        Log.info("connection ready to \(endpointName)")
+        guard !stopped, connection === conn else { return }
+        Log.info("connection ready to \(endpointName) via \(currentTransportKind.displayName)")
         connectionReady = true
         everConnected = true
         awaitingWake = false
@@ -1031,6 +1075,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         lastReceived = Date()  // fresh grace period for the watchdog
         refreshUSBLinkInfo()
         refreshAWDLLinkInfo()
+        // switchTransport intentionally tears down the old dedicated PCM flow;
+        // recreate it on the new physical route without touching capture/VD.
+        if let info = lastHello { configureAudioLane(for: info) }
         receiveControl(on: conn)
         Task { await self.status("Connected to \(self.endpointName)") }
     }
@@ -1113,7 +1160,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // Network.framework opt-in. Requiring the discovered awdl0 interface
         // makes "AWDL" deterministic; nil retains normal AP-routed Wi-Fi.
         if let requiredInterface {
-            params.includePeerToPeer = true
+            params.includePeerToPeer = Self.isAWDL(requiredInterface)
             params.requiredInterface = requiredInterface
         }
         let conn = NWConnection(to: endpoint, using: params)
@@ -1129,16 +1176,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             guard let self, generation == self.dialGeneration, !self.stopped,
                   self.connection === conn, conn.state != .ready else { return }
             Log.info("dial timed out in \(conn.state) — redialing")
+            self.notifyTransportFailure()
             self.scheduleReconnect()
         }
-        conn.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
+        conn.stateUpdateHandler = { [weak self, weak conn] state in
+            guard let self, let conn, !self.stopped,
+                  generation == self.dialGeneration, self.connection === conn else { return }
             switch state {
             case .ready:
                 self.becomeReady(conn)
             case .failed(let error):
                 Log.info("connection failed: \(error)")
                 self.connectionReady = false
+                self.notifyTransportFailure()
                 if case .posix(let code) = error, code == .ECONNREFUSED {
                     self.dialRefused()
                 }
@@ -1149,6 +1199,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 // waiting as failure and poll by reconnecting.
                 Log.info("connection waiting: \(error) — will retry")
                 self.connectionReady = false
+                self.notifyTransportFailure()
                 // Read the queue-confined flag here (handler runs on queue),
                 // not inside the detached status Task.
                 let text = self.awaitingWake
@@ -1182,12 +1233,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     self.connectedUSBUDID = device.udid
                     self.connectedUSBLocationID = device.locationID
                     self.connection = conn
-                    conn.stateUpdateHandler = { [weak self] state in
-                        guard let self else { return }
+                    conn.stateUpdateHandler = { [weak self, weak conn] state in
+                        guard let self, let conn, !self.stopped,
+                              generation == self.dialGeneration, self.connection === conn else { return }
                         switch state {
                         case .failed(let error):
                             Log.info("usb connection failed: \(error)")
                             self.connectionReady = false
+                            self.notifyTransportFailure()
                             self.scheduleReconnect()
                         case .cancelled:
                             self.connectionReady = false
@@ -1216,6 +1269,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                         hint = "USB connection failed: \(error.localizedDescription)"
                     }
                     Task { await self.status(hint) }
+                    self.notifyTransportFailure()
                     self.scheduleReconnect()
                 }
             }
@@ -1258,7 +1312,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             let params = NWParameters(tls: nil, tcp: tcp)
             params.serviceClass = .responsiveData
             if let requiredInterface {
-                params.includePeerToPeer = true
+                params.includePeerToPeer = Self.isAWDL(requiredInterface)
                 params.requiredInterface = requiredInterface
             }
             let conn = NWConnection(to: target, using: params)
@@ -1356,6 +1410,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         audioAccumulatorCaptureMs = nil
     }
 
+    private func notifyTransportFailure() {
+        let kind = currentTransportKind
+        Task { @MainActor in self.onTransportFailure?(kind) }
+    }
+
     private func scheduleReconnect() {
         guard !stopped else { return }
         if everConnected {
@@ -1447,13 +1506,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 } else {
                     usbLink = ""
                 }
-                let transportLabel: String
-                switch self.transport {
-                case .usb:
-                    transportLabel = "USB"
-                case .tcp(_, let requiredInterface):
-                    transportLabel = requiredInterface == nil ? "WiFi" : "AWDL"
-                }
+                let transportLabel = self.currentTransportKind.displayName
                 let audioLane = self.audioConnectionReady ? "dedicated" : "inline"
                 let awdl = self.awdlLinkInfo
                 self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps),\"encFps\":\(encFps),\"encMs50\":\(enc50),\"encMs95\":\(enc95),\"encInFlight\":\(encodeInflightNow),\"encPeak\":\(encodeInflightPeak),\"encLimit\":\(self.maxPendingEncodes),\"wireMs50\":\(wire50),\"wireMs95\":\(wire95),\"frameKB\":\(frameKB),\"usbMbps\":\(usbMbps),\"usbLink\":\"\(usbLink)\",\"audioTxDrops\":\(self.audioPacketsDropped),\"audioLane\":\"\(audioLane)\",\"audioCapMs\":\(self.audioCaptureBufferMs),\"audioSend50\":\(audioSend50),\"audioSend95\":\(audioSend95),\"awdlChannel\":\(awdl?.channel ?? 0),\"awdlBand\":\(awdl?.band ?? 0),\"awdlWidth\":\(awdl?.bandwidthMHz ?? 0),\"awdlFreq\":\(awdl?.frequencyMHz ?? 0),\"awdlTx\":\(awdl?.txRateMbps ?? 0),\"awdlRx\":\(awdl?.rxRateMbps ?? 0),\"awdlMax\":\(awdl?.maxLinkMbps ?? 0),\"awdlMCS\":\(awdl?.mcs ?? -1),\"awdlRSSI\":\(awdl?.rssi ?? 0),\"awdlPHY\":\(awdl?.phyMode ?? -1),\"transport\":\"\(transportLabel)\"}")
@@ -1587,12 +1640,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - Control messages (phone -> Mac)
 
     private func receiveControl(on conn: NWConnection) {
-        conn.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, _, error in
-            guard let self, error == nil, let data, data.count == 4 else { return }
+        conn.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self, weak conn] data, _, _, error in
+            guard let self, let conn, !self.stopped, self.connection === conn,
+                  error == nil, let data, data.count == 4 else { return }
             let len = Int(UInt32(bigEndian: data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }))
             guard len > 0, len < 1 << 20 else { return }
-            conn.receive(minimumIncompleteLength: len, maximumLength: len) { [weak self] payload, _, _, error in
-                guard let self, error == nil, let payload, payload.count == len else { return }
+            conn.receive(minimumIncompleteLength: len, maximumLength: len) { [weak self, weak conn] payload, _, _, error in
+                guard let self, let conn, !self.stopped, self.connection === conn,
+                      error == nil, let payload, payload.count == len else { return }
                 self.handleControl(payload)
                 self.receiveControl(on: conn)
             }
@@ -1621,7 +1676,22 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         case "stats":
             // Aggregated pipeline health measured on the phone — logged here
-            // so one file holds both ends of the story.
+            // so one file holds both ends of the story, and feed the dynamic
+            // route policy. Mbps is diagnostic only and never affects score.
+            let routeNetDrops = dropsNetThisWindow
+            if let rtt = (obj["rtt"] as? NSNumber)?.doubleValue,
+               let e2e95 = (obj["e2e95"] as? NSNumber)?.doubleValue {
+                let sample = TransportHealthSample(
+                    rttMs: rtt,
+                    e2e95Ms: e2e95,
+                    stalls: (obj["stalls"] as? NSNumber)?.intValue ?? 0,
+                    netDrops: routeNetDrops,
+                    fps: (obj["fps"] as? NSNumber)?.doubleValue ?? 0,
+                    captureFps: (obj["capFps"] as? NSNumber)?.doubleValue ?? 0,
+                    mbps: (obj["mbps"] as? NSNumber)?.doubleValue ?? 0)
+                let kind = currentTransportKind
+                Task { @MainActor in self.onTransportHealth?(kind, sample) }
+            }
             if let json = try? JSONSerialization.data(withJSONObject: obj),
                let line = String(data: json, encoding: .utf8) {
                 Log.info("PHONE-STATS \(line) | mac enc↓=\(dropsEncThisWindow) net↓=\(dropsNetThisWindow) pending=\(pendingSends)")
@@ -1884,7 +1954,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// ScreenCaptureKit is configured to deliver 48 kHz stereo. It exposes
     /// audio as Float32 PCM buffers; convert to signed 16-bit interleaved PCM.
-    /// Protocol 6 then slices each callback into 5 ms chunks and sends them on
+    /// Protocol 6 then slices each callback into 2.5 ms chunks and sends them on
     /// a dedicated TCP flow. Smaller chunks do not make SCK capture itself
     /// faster, but they prevent one large callback from becoming one large
     /// receiver scheduling unit and expose the true capture granularity in HUD.
@@ -1937,7 +2007,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     /// Keep a timestamp for the first frame in the accumulator, then emit
-    /// fixed 5 ms packets. State lives on the sender queue, not the SCK audio
+    /// fixed 2.5 ms packets. State lives on the sender queue, not the SCK audio
     /// callback queue, so transport switches and reconnects remain serialized.
     private func enqueueUltraLowLatencyPCM(_ pcm: Data, captureStartMs: Double) {
         let bytesPerFrame = 2 * MemoryLayout<Int16>.size
