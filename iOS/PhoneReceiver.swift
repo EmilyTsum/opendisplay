@@ -188,8 +188,11 @@ final class PhoneReceiver: ObservableObject {
     private var audioIOBufferMs = 0.0
     private var audioOutputLatencyMs = 0.0
     private var audioFormatLabel = ""
-    private let maxAudioQueueMs = 10.0
-    private let maxAudioPacketAgeMs = 30.0
+    private let targetAudioPrebufferMs = 10.0
+    private let maxAudioQueueMs = 30.0
+    private let hardAudioResyncMs = 60.0
+    private let maxAudioPacketAgeMs = 60.0
+    private var audioPlaybackPrimed = false
 
     private var nowMs: Double { Date().timeIntervalSince1970 * 1000 }
 
@@ -721,6 +724,7 @@ final class PhoneReceiver: ObservableObject {
         audioQueuedBuffers = 0
         audioQueuedFrames = 0
         audioQueueMs = 0
+        audioPlaybackPrimed = false
         lastAudioSequence = nil
         audioArrivalAgeMs = 0
         audioFormatLabel = ""
@@ -1078,16 +1082,21 @@ final class PhoneReceiver: ObservableObject {
         let packetMs = Double(framesInt) * 1000.0 / Double(sampleRate)
         let queuedMs = Double(audioQueuedFrames) * 1000.0 / Double(sampleRate)
 
-        // Freshness beats completeness for a remote display. If scheduled
-        // audio exceeds the shallow budget, flush old audio and immediately
-        // restart from this newest packet instead of accumulating A/V lag.
-        if queuedMs + packetMs > maxAudioQueueMs, audioQueuedFrames > 0 {
+        // Keep a small jitter cushion instead of hard-flushing the player every
+        // time a 2.5–5 ms scheduling wobble crosses the target. Hard flushes
+        // were heard as clicks/dropouts. First cap growth by dropping the newest
+        // packet; only an actually stale (>60 ms) queue is resynchronised.
+        if queuedMs >= hardAudioResyncMs, audioQueuedFrames > 0 {
             audioPlaybackGeneration &+= 1
             audioPlayer.stop()
             audioQueuedBuffers = 0
             audioQueuedFrames = 0
             audioQueueMs = 0
+            audioPlaybackPrimed = false
             audioResyncs += 1
+        } else if queuedMs + packetMs > maxAudioQueueMs {
+            audioDrops += 1
+            return
         }
 
         guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return }
@@ -1109,9 +1118,16 @@ final class PhoneReceiver: ObservableObject {
                 self.audioQueuedBuffers = max(0, self.audioQueuedBuffers - 1)
                 self.audioQueuedFrames = max(0, self.audioQueuedFrames - framesInt)
                 self.audioQueueMs = Double(self.audioQueuedFrames) * 1000.0 / Double(sampleRate)
+                if self.audioQueuedFrames == 0 {
+                    self.audioPlaybackPrimed = false
+                    self.audioPlayer.pause()
+                }
             }
         }
-        if !audioPlayer.isPlaying { audioPlayer.play() }
+        if !audioPlaybackPrimed, audioQueueMs >= targetAudioPrebufferMs {
+            audioPlaybackPrimed = true
+            audioPlayer.play()
+        }
     }
 
     private func ensureAudioPlayback(sampleRate: Double,
@@ -1125,9 +1141,9 @@ final class PhoneReceiver: ObservableObject {
                 let session = AVAudioSession.sharedInstance()
                 try session.setCategory(.playback, mode: .default)
                 try session.setPreferredSampleRate(sampleRate)
-                // 120 frames at 48 kHz = 2.5 ms. iOS treats this as a request;
+                // Match the 5 ms wire packet cadence. iOS treats this as a request;
                 // record the actual duration below so the HUD reports reality.
-                try? session.setPreferredIOBufferDuration(0.0025)
+                try? session.setPreferredIOBufferDuration(0.005)
                 try session.setActive(true)
                 audioIOBufferMs = session.ioBufferDuration * 1000
                 audioOutputLatencyMs = session.outputLatency * 1000

@@ -325,7 +325,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var audioPCMAccumulator = Data()
     private var audioAccumulatorCaptureMs: Double?
     private var audioSequence: UInt32 = 0
-    private let audioChunkFrames = 120        // 2.5 ms @ 48 kHz
+    private let audioChunkFrames = 240        // 5 ms @ 48 kHz; lower syscall/scheduling jitter than 2.5 ms
     private var audioCaptureBufferMs = 0.0
     private var audioLaneSendP50 = 0.0
     private var audioLaneSendP95 = 0.0

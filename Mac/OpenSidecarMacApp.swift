@@ -434,15 +434,14 @@ final class SenderController: ObservableObject {
         }
     }
 
-    /// Cable unplugged under a live session: fail over to the device's WiFi
-    /// service if one is visible. Without one the session keeps its normal
-    /// fate — retry over USB through the grace period, then end.
+    /// A manual USB selection stays USB when the cable disappears. The sender
+    /// will report/retry that route; the user can choose AWDL or Wi-Fi from the
+    /// route Picker instead of the controller silently moving the live stream.
     private func failover(detachedUDIDs: Set<String>) {
-        guard autoConnectEnabled, !detachedUDIDs.isEmpty else { return }
+        guard !detachedUDIDs.isEmpty else { return }
         for session in sessions where session.transportKind == .usb {
             guard let udid = session.usbUDID, detachedUDIDs.contains(udid) else { continue }
-            Log.info("cable detached for \(session.id) — immediate route failover")
-            handleTransportFailure(session, failed: .usb)
+            Log.info("selected USB route detached for \(session.id) — awaiting manual route choice")
         }
     }
 
@@ -743,58 +742,36 @@ final class SenderController: ObservableObject {
         Log.info(String(format: "ROUTE %@ score=%.1f rtt=%.1f e2e95=%.1f stalls=%d drops=%d fps=%.0f/%.0f",
                         kind.displayName, score, sample.rttMs, sample.e2e95Ms,
                         sample.stalls, sample.netDrops, sample.fps, sample.captureFps))
-
-        if let outcome = session.routePolicy.probeOutcome(now: now) {
-            finishProbe(session, outcome: outcome, now: now)
-            return
-        }
-
-        let available = Set(availableTransports(for: session).keys)
-        if let better = session.routePolicy.bestCachedCandidate(available: available, now: now) {
-            let currentScore = session.routePolicy.estimate(for: session.routePolicy.current)?.score ?? 0
-            let candidateScore = session.routePolicy.estimate(for: better)?.score ?? 0
-            switchRoute(session, to: better,
-                        reason: String(format: "score %.1f vs %.1f", candidateScore, currentScore))
-            return
-        }
-        if let candidate = session.routePolicy.nextProbeCandidate(available: available, now: now),
-           session.routePolicy.beginProbe(candidate, now: now) {
-            switchRoute(session, to: candidate, reason: "candidate health sample", probing: true)
-            let timeout = session.routePolicy.configuration.probeTimeoutSeconds + 0.25
-            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self, weak session] in
-                guard let self, let session,
-                      self.sessions.contains(where: { $0 === session }),
-                      session.routePolicy.activeProbeCandidate == candidate,
-                      let outcome = session.routePolicy.probeOutcome() else { return }
-                self.finishProbe(session, outcome: outcome, now: ProcessInfo.processInfo.systemUptime)
-            }
-        }
-    }
-
-    private func finishProbe(_ session: DeviceSession, outcome: TransportProbeOutcome, now: TimeInterval) {
-        switch outcome {
-        case .keep(let candidate):
-            session.routePolicy.commitSwitch(to: candidate, now: now)
-            Log.info("route probe accepted — keeping \(candidate.displayName)")
-        case .revert(let baseline):
-            Log.info("route probe rejected — returning to \(baseline.displayName)")
-            switchRoute(session, to: baseline, reason: "probe rejected")
-        }
+        // Route health remains visible for diagnostics, but never drives an
+        // automatic socket migration. In practice AWDL and infrastructure
+        // Wi-Fi can trade a few milliseconds from one stats window to the
+        // next; probing them by actually moving the live stream caused visible
+        // flapping and, worse, repeatedly tore down the dedicated audio lane.
+        // The user explicitly selects USB / AWDL / Wi-Fi in SessionRow.
     }
 
     private func handleTransportFailure(_ session: DeviceSession, failed: TransportKind) {
         guard sessions.contains(where: { $0 === session }), session.transportKind == failed else { return }
         session.routePolicy.cancelProbe()
-        let candidates = availableTransports(for: session).keys.filter { $0 != failed }
-        guard !candidates.isEmpty else { return }
-        let candidate = candidates.min { lhs, rhs in
-            let l = session.routePolicy.estimate(for: lhs)?.score ?? Double.greatestFiniteMagnitude
-            let r = session.routePolicy.estimate(for: rhs)?.score ?? Double.greatestFiniteMagnitude
-            if l == r { return lhs.rawValue < rhs.rawValue }
-            return l < r
-        }!
-        Log.info("route failure on \(failed.displayName) — failover to \(candidate.displayName) (hysteresis bypassed)")
-        switchRoute(session, to: candidate, reason: "route failure")
+        Log.info("selected route \(failed.displayName) failed — retaining manual route selection")
+    }
+
+    /// Routes currently observable for this receiver. Keep the active route in
+    /// the menu even during a brief discovery dropout so the Picker selection
+    /// never jumps on its own.
+    func availableRouteKinds(for session: DeviceSession) -> [TransportKind] {
+        let reachable = Set(availableTransports(for: session).keys).union([session.transportKind])
+        return [.usb, .awdl, .wifi].filter { reachable.contains($0) }
+    }
+
+    func selectRoute(_ session: DeviceSession, kind: TransportKind) {
+        guard sessions.contains(where: { $0 === session }), kind != session.transportKind else { return }
+        guard availableTransports(for: session)[kind] != nil else {
+            Log.info("manual route \(kind.displayName) requested but is not currently reachable")
+            return
+        }
+        session.routePolicy.cancelProbe()
+        switchRoute(session, to: kind, reason: "user selected")
     }
 
     /// User-initiated disconnect: also opt the device out of auto-connect.
@@ -1255,6 +1232,18 @@ struct SessionRow: View {
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
+            Picker("Route", selection: Binding(
+                get: { session.transportKind },
+                set: { controller.selectRoute(session, kind: $0) }
+            )) {
+                ForEach(controller.availableRouteKinds(for: session), id: \.self) { kind in
+                    Text(kind.displayName).tag(kind)
+                }
+            }
+            .labelsHidden()
+            .controlSize(.small)
+            .fixedSize()
+            .help("Choose the physical transport. OpenDisplay will not switch routes automatically.")
             Button {
                 session.sender.forceReconnect()
             } label: {
